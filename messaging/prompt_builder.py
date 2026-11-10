@@ -57,6 +57,31 @@ class PromptBuilder:
         if not node:return "无明确安排"
         return f"{node.get('summary','')}（{node.get('location','')}）"
 
+    _KIND_LABELS={"sleep":"睡觉","nap":"打盹","rest":"休息","meal":"吃饭",
+                  "work":"做事","study":"学东西","leisure":"闲散","travel":"外出"}
+
+    @classmethod
+    def _plan_text(cls,nodes:list[dict[str,Any]]|None)->str:
+        """当天时段的结构化摘要：只给时间 + 类型，真实的才带细节。
+
+        被问"你今天日程啥样"时，模型手里如果只有"当前是基调"，就会拿未完话题
+        （对方聊过的拳击、饺子）来填，结果把自己的话安到麦麦身上。给它这份结构，
+        它就能老老实实答"上午做事、下午闲散"，不编具体活动。
+        """
+        rows=[]
+        for node in (nodes or [])[:16]:
+            if not isinstance(node,dict): continue
+            try:
+                start=int(node.get("start_minute") or 0); end=int(node.get("end_minute") or 0)
+            except (TypeError,ValueError): continue
+            label=cls._KIND_LABELS.get(str(node.get("kind") or ""),"日常")
+            if str(node.get("node_source") or "generated")=="real":
+                title=" ".join(str(node.get("summary") or "").split())[:40]
+                rows.append(f"{start//60:02d}:{start%60:02d}-{end//60:02d}:{end%60:02d} {label}（真实：{title}）")
+            else:
+                rows.append(f"{start//60:02d}:{start%60:02d}-{end//60:02d}:{end%60:02d} {label}")
+        return "；".join(rows)
+
     @staticmethod
     def _scene_contract(node:dict[str,Any]|None)->str:
         """时段的可叙述性契约，替代裸传 summary。
@@ -250,6 +275,9 @@ class PromptBuilder:
             f"平台 {env.get('platform','unknown')}，适配器 {env.get('adapter','unknown')}，会话 {env.get('chat_type','private')}，媒介 {','.join(env.get('media') or ['text'])}；"
             f"天气 {_safe(weather.get('description','天气未知'))}；当前时段 {_safe(self._scene_contract(context.get('current')))}；"
             f"下一时段 {_safe(self._scene_contract(context.get('next')))}。\n"
+            f"【今天的时段安排】{_safe(self._plan_text(context.get('nodes')))}。"
+            "这是时间结构：问起日程只能答到\u300c几点在做什么类型的事\u300d，标了\u300c真实\u300d的才可以说细节；"
+            "不得补具体活动名。\n"
             "【当前消息与连续话题】\n"
             f"当前消息意图（本地初判）{_safe(current_intent or continuity.get('intent') or '未知',100)}；"
             f"未完话题 {_safe('；'.join(str(item) for item in topics) or '无',500)}；"
@@ -281,13 +309,16 @@ class PromptBuilder:
                              ) if interest_text_reply else ""
         text=(
             "【回复边界】以下是辅助背景，不是用户刚说的事实；不相关时不要提及，也不要逐项汇报状态。"
-            "只有「已确认真实发生」的内容可以说成自己在做的事；「只是时间基调」的时段不得叙述成具体活动。\n"
+            "只有「已确认真实发生」的内容可以说成自己在做的事；「只是时间基调」的时段不得叙述成具体活动。"
+            "未完话题、聊天内容和主人的日程都属于对方，不是你自己的经历，绝不能写成你在做的事。\n"
             "\n【回复所需生活摘要】\n"
             f"当前活动口径 {_safe(state.get('current_activity','没什么具体安排'))}；位置感 {_safe(state.get('current_location','家里'))}；"
             f"精力 {state.get('energy',70):.0f}/100（0 耗尽、100 满电）；心情 {state.get('mood_valence',0):.2f}（-1 低落 ~ +1 愉快）；"
             f"关系阶段 {relationship_stage(float(user.get('temperature',30)))}；角色 {user.get('role','friend')}。{self._role_text(user)}\n"
             f"环境：{env.get('time_period','未知时段')}，{env.get('day_type','未知')}，{festival_text}媒介 {','.join(env.get('media') or ['text'])}；"
             f"天气 {_safe(weather.get('description','天气未知'))}；当前时段 {_safe(self._scene_contract(context.get('current')))}。\n"
+            f"【今天的时段安排】{_safe(self._plan_text(context.get('nodes')))}。"
+            "被问日程时只能按这个答时间与类型，标\u300c真实\u300d的才可给细节，不得另编活动。\n"
             f"当前意图 {_safe(current_intent or continuity.get('intent') or '未知',100)}；"
             f"可能相关的未完话题 {_safe('；'.join(str(item) for item in topics) or '无',360)}；"
             f"未回应摘要 {_safe(' '.join(backlogs) or '无',360)}。\n"
