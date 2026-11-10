@@ -284,10 +284,16 @@ class MemoryService:
                 task_kind="diary",request_type="daily_diary",
             )
             if isinstance(raw,dict):result=raw
+        # 当天框架若整体来自内置骨架（source 全为 fallback），日记里的具体事件不可信，
+        # 打上标记让注入层只取情绪基调，避免把编出来的事当成真实回忆。
+        framework=await self.store.get_framework(day)
+        reliability="fallback" if framework and all(
+            str(node.get("source") or "")=="fallback" for node in framework) else "normal"
         await self.store.save_diary(
             day,str(result.get("title") or fallback["title"]),
             str(result.get("content") or fallback["content"])[:int(self.config.memory.diary_max_chars)],
             str(result.get("mood_summary") or fallback["mood_summary"]),digest,now.timestamp(),
+            reliability=reliability,
         )
         owners=[item for item in await self.store.list_users(proactive_only=True) if str(item.get("role") or "friend")=="owner"]
         if owners:

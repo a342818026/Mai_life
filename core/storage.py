@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 # 长期运行记录（互动、主动事件、契机、转述候选/事件、跳过统计）的保留天数。
 # 这些表没有过期字段驱动的外部清理，超期行必须在 cleanup_runtime_records 中删除，
 # 否则只会无限增长；pending 与在途行永远保留，避免打断正在结算的引用。
@@ -558,6 +558,8 @@ class LifeStore:
             self._migrate_to_v14()
         if version < 15:
             self._migrate_to_v15()
+        if version < 17:
+            self._migrate_to_v17()
         self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(SCHEMA_VERSION),))
         now = time.time()
         self.conn.execute(
@@ -660,6 +662,42 @@ class LifeStore:
         """
         self._ensure_column("daily_framework","node_source","TEXT NOT NULL DEFAULT 'generated'")
         self._ensure_column("daily_framework","activity_id","TEXT NOT NULL DEFAULT ''")
+
+    def _migrate_to_v17(self) -> None:
+        """v17 给日记加可信度标记，并把「日程整体回退」时期写成的旧日记标成 fallback。
+
+        保证同一件编出来的事（如兜底骨架里的拼图）不会被当成真实回忆反复提起。
+        """
+        self._ensure_column("diary_entries","reliability","TEXT NOT NULL DEFAULT 'normal'")
+        # 骨架原文清单来自日程服务：逐字照抄骨架的日子，其日程与真实生活无关。
+        try:
+            from ..life.schedule_service import BUILTIN_SUMMARIES as skeleton
+        except Exception:
+            try:
+                from life.schedule_service import BUILTIN_SUMMARIES as skeleton
+            except Exception:
+                skeleton=frozenset()
+        with self._tx() as conn:
+            # 规则一：当天框架整体来自兜底（source 全为 fallback）。
+            conn.execute(
+                """UPDATE diary_entries SET reliability='fallback'
+                WHERE reliability='normal' AND day IN (
+                    SELECT day FROM daily_framework GROUP BY day
+                    HAVING SUM(CASE WHEN source='llm' THEN 1 ELSE 0 END)=0
+                )"""
+            )
+            # 规则二：即使标成 llm，只要节点大面积照抄骨架原文，同样不可信。
+            if skeleton:
+                hits: dict[str, int] = {}
+                for day, summary in conn.execute(
+                        "SELECT day, summary FROM daily_framework").fetchall():
+                    if summary in skeleton:
+                        hits[str(day)] = hits.get(str(day), 0) + 1
+                for day, count in hits.items():
+                    if count >= 2:
+                        conn.execute(
+                            "UPDATE diary_entries SET reliability='fallback' "
+                            "WHERE day=? AND reliability='normal'", (day,))
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         """幂等补充 SQLite 列，避免测试阶段升级时覆盖已有生活数据。"""
@@ -2290,15 +2328,19 @@ class LifeStore:
             self.conn.commit()
 
     async def save_diary(self, day: str, title: str, content: str, mood_summary: str,
-                         source_digest: str, created_at: float) -> None:
-        """保存私人日记，并同步维护书柜中的同一日记文档及其修订。"""
+                         source_digest: str, created_at: float, reliability: str = "normal") -> None:
+        """保存私人日记，并同步维护书柜中的同一日记文档及其修订。
+
+        reliability='fallback' 表示当天日程整体回退到内置骨架，日记里的具体事件不可信。
+        """
         async with self._lock:
             with self._tx() as conn:
                 conn.execute(
                     """INSERT OR IGNORE INTO diary_entries
-                    (day,created_at,title,content,mood_summary,privacy,source_digest)
-                    VALUES(?,?,?,?,?,'private',?)""",
-                    (day,created_at,title[:120],content[:4000],mood_summary[:300],source_digest[:128]),
+                    (day,created_at,title,content,mood_summary,privacy,source_digest,reliability)
+                    VALUES(?,?,?,?,?,'private',?,?)""",
+                    (day,created_at,title[:120],content[:4000],mood_summary[:300],source_digest[:128],
+                     reliability if reliability in {"normal","fallback"} else "normal"),
                 )
                 document_id=f"diary:{day}"
                 conn.execute(

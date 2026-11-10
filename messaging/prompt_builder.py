@@ -90,7 +90,13 @@ class PromptBuilder:
         dates=data.get("upcoming_dates") if isinstance(data.get("upcoming_dates"),list) else []
         date_text="；".join(f"{item.get('name','安排')} {item.get('date','')}（{item.get('days',0)}天后）" for item in dates[:8]) or "无"
         if diary:
-            diary_text=f"{diary.get('day','')} {diary.get('title','')}：{diary.get('mood_summary','')}；{diary.get('content','')}"
+            if str(diary.get("reliability") or "normal")!="normal":
+                # 日程整日回退到内置骨架时写成的日记：正文里的具体事件是编的，
+                # 只留情绪基调，正文一律不进 prompt，避免「昨天拼图拼完了」这类假回忆。
+                diary_text=(f"{diary.get('day','')}（写于日程回退期，只可参考情绪，"
+                            f"里面的具体事件都不可信、不得当成回忆提起）：{diary.get('mood_summary','')}")
+            else:
+                diary_text=f"{diary.get('day','')} {diary.get('title','')}：{diary.get('mood_summary','')}；{diary.get('content','')}"
         else:
             # 区分“还没有日记”与“无权读取”，避免对主人显示越界文案。
             diary_text="最近还没有生成生活日记" if is_owner else "当前关系无权读取私人日记"
