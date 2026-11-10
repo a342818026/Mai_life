@@ -412,6 +412,8 @@ class MaiLifePlugin(MaiBotPlugin):
         self._information=InformationService(self.ctx,self._store,self.config,self._llm,self.ctx.logger,bot_name=self._bot_name)
         self._interest=InterestService(self._store,self.config,self._llm,self.ctx.logger,
                                        self._information.search,bot_name=self._bot_name)
+        # 自主探索优先从兴趣库选题：兴趣越多、事实越少的越优先，真事才和他相关。
+        self._information.set_interest_provider(self._interest.planning_topics)
         self._group_observer=GroupObserver(self._store,self.config,self._llm,self.ctx.logger)
         self._relay=RelayService(self.ctx,self._store,self.config,self.ctx.logger,bot_name=self._bot_name)
         self._bookshelf=BookshelfService(self._store,self.config)

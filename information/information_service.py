@@ -31,6 +31,12 @@ class InformationService:
         self.bot_name=bot_name
         self.search=HostSearchService(ctx,store,config,logger)
         self.news=NewsService(store,config,self.search,logger,llm,bot_name=self.bot_name)
+        # 兴趣库先于本服务可用性不确定：用可选的异步提供方解耦，未挂上就走原来的自由选题。
+        self._interest_provider:Any=None
+
+    def set_interest_provider(self,provider:Any)->None:
+        """挂上兴趣主题提供方（InterestService.planning_topics）。"""
+        self._interest_provider=provider
 
     def update_config(self,config:Any)->None:
         self.config=config; self.search.update_config(config); self.news.update_config(config)
@@ -174,11 +180,21 @@ class InformationService:
         safe_topics=[await self.search.sanitize_query(topic) for topic in chat_topics[:5]] if self.config.network.search_include_chat_topics else []
         safe_topics=[topic for topic in safe_topics if topic]
         if not self.llm.task_available("search"):return fallback
+        known:list[dict[str,Any]]=[]
+        if self._interest_provider is not None:
+            try:
+                known=list(await self._interest_provider(now,5) or [])
+            except Exception as exc:
+                self.logger.info(f"[MaiLife] 兴趣主题读取失败，本次自由选题: {str(exc)[:120]}")
+                known=[]
         context={"personality":personality[:1200],"state":{"energy":state.get("energy"),"mood":state.get("mood_valence"),
                   "activity":state.get("current_activity")},"schedule":{"current":schedule.get("current"),"next":schedule.get("next")},
-                 "anonymous_chat_topics":safe_topics}
+                 "anonymous_chat_topics":safe_topics,"known_interests":known}
+        guide=("优先从 known_interests 里挑一个具体角度去了解（选事实少的那个，正好是还不了解的）；"
+               "known_interests 为空时才自由选题。") if known else ""
         result=await self.llm.generate_json(
-            f"为{self.bot_name}选择一个此刻真想了解的具体主题。不能搜索用户身份、账号、群名、私密关系、聊天原句或敏感个人信息。\n"+
+            f"为{self.bot_name}选择一个此刻真想了解的具体主题。不能搜索用户身份、账号、群名、私密关系、聊天原句或敏感个人信息。"
+            f"{guide}\n"+
             json.dumps(context,ensure_ascii=False)+"\n只返回JSON：topic、query、reason。query适合普通网页搜索，最多100字。",
             "你规划低频、克制且保护隐私的自主探索。",fallback,max_tokens=0,
             task_kind="search",request_type="search_query_planning",

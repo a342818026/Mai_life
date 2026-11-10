@@ -279,6 +279,31 @@ class InterestService:
             })
         return {"items": items}
 
+    async def planning_topics(self, now: Any, limit: int = 5) -> list[dict[str, Any]]:
+        """给自主探索用的候选主题：越常被提到、事实越少的越靠前（正好需要补）。
+
+        只返回 active 的，冷却/归档的不参与；一条都没有时返回空列表，
+        调用方应回落到"自己随便找一个主题"，而不是硬套用户兴趣。
+        """
+        if not self.config.interest.enabled:
+            return []
+        topics = await self.store.list_interest_topics(status="active", limit=50)
+        if not topics:
+            return []
+        counts = await self.store.interest_fact_counts()
+        rows = []
+        for topic in topics[:20]:
+            tid = str(topic.get("id") or "")
+            rows.append({
+                "topic": str(topic.get("topic") or ""),
+                "domain": str(topic.get("domain") or ""),
+                "mentions": int(topic.get("mention_count") or 0),
+                "facts": counts.get(tid, 0),
+            })
+        # 提及多但事实少 = 最值得去补的角度
+        rows.sort(key=lambda item: (-item["mentions"], item["facts"]))
+        return rows[:max(1, int(limit))]
+
     async def decay(self, now: Any) -> int:
         cfg = self.config.interest
         if not cfg.enabled:
