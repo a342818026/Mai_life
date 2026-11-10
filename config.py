@@ -1135,6 +1135,62 @@ class LinkageSettings(PluginConfigBase):
     )
 
 
+class InterestSettings(PluginConfigBase):
+    """兴趣知识库：只从指定私聊学习兴趣，夜里静默联网补基本知识。"""
+
+    __ui_label__: ClassVar[str] = "兴趣知识库"
+    __ui_order__: ClassVar[int] = 16
+
+    enabled: bool = Field(default=True, description="启用兴趣知识库。",
+        json_schema_extra=_ui("启用兴趣知识库", "默认开启；关闭后不抽取、不补知识、不注入。", 0,
+                              label_en="Enable Interest Library",
+                              hint_en="When off, nothing is extracted, enriched or injected."))
+    owner_qq_list: list[str] = Field(default_factory=list, description="允许学习兴趣的 QQ 号（只学这些人的私聊）。",
+        json_schema_extra=_ui("学习对象 QQ 号", "留空表示一个都不学；只处理私聊，群聊一律不学。", 1,
+                              label_en="Owner QQ List",
+                              hint_en="Only these QQ numbers are learned from, private chat only."))
+    extract_daily_max: int = Field(default=20, ge=0, le=200, description="每天最多调用模型抽取的次数。",
+        json_schema_extra=_ui("每日抽取上限", "只有命中兴趣信号的消息才会抽取，上限防刷模型额度。", 2,
+                              label_en="Daily Extraction Limit",
+                              hint_en="Caps model calls; only messages with interest signals are extracted."))
+    enrich_enabled: bool = Field(default=True, description="夜间静默联网补基本知识。",
+        json_schema_extra=_ui("静默补知识", "夜里批量联网补，不阻塞聊天；查不到就留空，不编造。", 3,
+                              label_en="Silent Enrichment",
+                              hint_en="Nightly background search; missing facts stay empty, never invented."))
+    enrich_hour: int = Field(default=3, ge=0, le=23, description="静默补知识的起始小时。",
+        json_schema_extra=_ui("补知识时段（0-23 点）", "默认凌晨 3 点开始，只在该小时内补一次。", 4,
+                              label_en="Enrichment Hour",
+                              hint_en="Runs once inside this hour."))
+    enrich_daily_max: int = Field(default=3, ge=0, le=20, description="每晚最多补几个兴趣主题。",
+        json_schema_extra=_ui("每晚上限（主题数）", "每个主题会发起一次搜索，别设太大。", 5,
+                              label_en="Nightly Topic Limit",
+                              hint_en="One search per topic."))
+    enrich_facts_per_topic: int = Field(default=3, ge=1, le=8, description="每个主题最多保留几条联网事实。",
+        json_schema_extra=_ui("每主题事实数", "只保留能写明来源的条目。", 6,
+                              label_en="Facts per Topic",
+                              hint_en="Only sourced facts are stored."))
+    context_item_limit: int = Field(default=3, ge=0, le=10, description="注入对话的兴趣条数。",
+        json_schema_extra=_ui("注入条数", "0 表示只积累不使用。", 7,
+                              label_en="Injected Items",
+                              hint_en="0 means collect only."))
+    confidence_floor: float = Field(default=0.35, ge=0, le=1, description="低于该置信度的事实不进对话。",
+        json_schema_extra=_ui("置信度门槛", "低置信度条目只留在库里，不进 prompt。", 8,
+                              label_en="Confidence Floor",
+                              hint_en="Low-confidence facts stay in the library only."))
+    cooling_days: int = Field(default=30, ge=1, le=365, description="多少天不提转入冷却。",
+        json_schema_extra=_ui("冷却天数", "冷却后不再注入。", 9,
+                              label_en="Cooling Days",
+                              hint_en="Cooling topics are no longer injected."))
+    archive_days: int = Field(default=90, ge=1, le=730, description="多少天不提转入归档。",
+        json_schema_extra=_ui("归档天数", "归档只保留数据，不再参与任何流程。", 10,
+                              label_en="Archive Days",
+                              hint_en="Archived topics keep data but take no part."))
+    note_enabled: bool = Field(default=True, description="是否让大肥鱼对兴趣写一句自己的看法。",
+        json_schema_extra=_ui("写自己的看法", "像读书批注那样，一天一个主题最多一条。", 11,
+                              label_en="Write Own Notes",
+                              hint_en="One note per topic per day."))
+
+
 class MaiLifeSettings(PluginConfigBase):
     """麦生活完整配置。"""
 
@@ -1205,6 +1261,12 @@ class MaiLifeSettings(PluginConfigBase):
     linkage: LinkageSettings = Field(
         default_factory=LinkageSettings,
         json_schema_extra=_ui("插件联动", "与其它插件的协作开关；目标插件未安装时不生效。", 15, label_en="Plugin Linkage", hint_en="Collaboration switches; ineffective when the target plugin is absent."),
+    )
+    interest: InterestSettings = Field(
+        default_factory=InterestSettings,
+        json_schema_extra=_ui("兴趣知识库", "只从指定私聊学习兴趣，夜里静默联网补基本知识。", 16,
+                              label_en="Interest Library",
+                              hint_en="Learns interests from listed private chats and enriches them quietly at night."),
     )
 
     @model_validator(mode="before")

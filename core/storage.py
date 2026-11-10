@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 # 长期运行记录（互动、主动事件、契机、转述候选/事件、跳过统计）的保留天数。
 # 这些表没有过期字段驱动的外部清理，超期行必须在 cleanup_runtime_records 中删除，
 # 否则只会无限增长；pending 与在途行永远保留，避免打断正在结算的引用。
@@ -198,6 +198,30 @@ class LifeStore:
               schedule_node_id TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_activity_log_started ON activity_log(started_at);
+            -- 兴趣知识库：topic 是"一个话题"，fact 是积累的条目，note 是大肥鱼自己的看法。
+            -- 结构照搬书柜（主档 + 条目），但不共用表：书柜有 owner/friend 权限边界，兴趣库只服务主人。
+            CREATE TABLE IF NOT EXISTS interest_topic(
+              id TEXT PRIMARY KEY, topic TEXT NOT NULL, domain TEXT NOT NULL DEFAULT '',
+              aliases TEXT NOT NULL DEFAULT '[]',
+              confidence REAL NOT NULL DEFAULT 0.5, mention_count INTEGER NOT NULL DEFAULT 1,
+              first_seen REAL NOT NULL, last_mentioned REAL NOT NULL,
+              last_enriched_at REAL NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT 'active'
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_interest_topic_name ON interest_topic(topic);
+            CREATE INDEX IF NOT EXISTS idx_interest_topic_seen ON interest_topic(last_mentioned);
+            CREATE TABLE IF NOT EXISTS interest_fact(
+              id TEXT PRIMARY KEY, topic_id TEXT NOT NULL,
+              fact TEXT NOT NULL, fact_type TEXT NOT NULL DEFAULT 'basic',
+              source TEXT NOT NULL DEFAULT 'chat', source_url TEXT NOT NULL DEFAULT '',
+              evidence_msg_id TEXT NOT NULL DEFAULT '',
+              confidence REAL NOT NULL DEFAULT 0.5, created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_interest_fact_topic ON interest_fact(topic_id,created_at);
+            CREATE TABLE IF NOT EXISTS interest_note(
+              id TEXT PRIMARY KEY, topic_id TEXT NOT NULL,
+              note TEXT NOT NULL, created_at REAL NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_framework_day ON daily_framework(day,start_minute);
             CREATE TABLE IF NOT EXISTS detailed_scenes(
               framework_id TEXT PRIMARY KEY, scene TEXT NOT NULL,
@@ -906,6 +930,171 @@ class LifeStore:
                     "UPDATE activity_log SET schedule_node_id=? WHERE id=?",
                     (str(node_id), str(activity_id)),
                 )
+
+    # ---------------- 兴趣知识库 ----------------
+
+    async def upsert_interest_topic(self, topic: str, *, domain: str = "", now: float | None = None,
+                                    aliases: Iterable[str] | None = None) -> dict[str, Any] | None:
+        """按名字建/更新兴趣主题：重复提到就累加次数、抬置信度、刷新最后提及时间。"""
+        name = " ".join(str(topic or "").split())[:80]
+        if not name:
+            return None
+        stamp = float(now or time.time())
+        topic_id = hashlib.sha256(name.casefold().encode()).hexdigest()[:24]
+        clean_aliases = [str(item)[:40] for item in (aliases or []) if str(item).strip()][:8]
+        async with self._lock:
+            with self._tx() as conn:
+                row = conn.execute(
+                    "SELECT id, aliases, mention_count, confidence FROM interest_topic WHERE topic=?",
+                    (name,),
+                ).fetchone()
+                if row:
+                    merged = list(dict.fromkeys(json.loads(row["aliases"] or "[]") + clean_aliases))[:8]
+                    conn.execute(
+                        """UPDATE interest_topic SET mention_count=mention_count+1,
+                        confidence=MIN(0.95, confidence+0.08), last_mentioned=?,
+                        status='active', aliases=?, domain=CASE WHEN ?<>'' THEN ? ELSE domain END
+                        WHERE id=?""",
+                        (stamp, json.dumps(merged, ensure_ascii=False), domain, domain, row["id"]),
+                    )
+                    topic_id = str(row["id"])
+                else:
+                    conn.execute(
+                        """INSERT INTO interest_topic
+                        (id,topic,domain,aliases,confidence,mention_count,first_seen,last_mentioned,last_enriched_at,status)
+                        VALUES(?,?,?,?,?,?,?,?,0,'active')""",
+                        (topic_id, name, domain, json.dumps(clean_aliases, ensure_ascii=False), 0.5, 1, stamp, stamp),
+                    )
+                saved = conn.execute("SELECT * FROM interest_topic WHERE id=?", (topic_id,)).fetchone()
+                return self._interest_topic_row(saved) if saved else None
+
+    @staticmethod
+    def _interest_topic_row(row: Any) -> dict[str, Any]:
+        data = dict(row)
+        try:
+            data["aliases"] = json.loads(data.get("aliases") or "[]")
+        except (TypeError, ValueError):
+            data["aliases"] = []
+        return data
+
+    async def get_interest_topic(self, key: str) -> dict[str, Any] | None:
+        """按 id 或名字取主题。"""
+        async with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM interest_topic WHERE id=? OR topic=? LIMIT 1", (str(key), str(key))
+            ).fetchone()
+            return self._interest_topic_row(row) if row else None
+
+    async def add_interest_fact(self, item: dict[str, Any]) -> bool:
+        """写一条兴趣事实；同主题同文本只留一条（id 由主题+内容哈希决定）。"""
+        topic_id = str(item.get("topic_id") or "").strip()
+        fact = " ".join(str(item.get("fact") or "").split())[:600]
+        if not topic_id or not fact:
+            return False
+        fact_id = str(item.get("id") or hashlib.sha256(f"{topic_id}:{fact.casefold()}".encode()).hexdigest()[:24])
+        async with self._lock:
+            with self._tx() as conn:
+                cursor = conn.execute(
+                    """INSERT OR IGNORE INTO interest_fact
+                    (id,topic_id,fact,fact_type,source,source_url,evidence_msg_id,confidence,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        fact_id, topic_id, fact,
+                        str(item.get("fact_type") or "basic")[:20],
+                        str(item.get("source") or "chat")[:20],
+                        str(item.get("source_url") or "")[:500],
+                        str(item.get("evidence_msg_id") or "")[:80],
+                        float(item.get("confidence") or 0.5),
+                        float(item.get("created_at") or time.time()),
+                    ),
+                )
+                return bool(cursor.rowcount)
+
+    async def list_interest_topics(self, *, status: str = "", limit: int = 50) -> list[dict[str, Any]]:
+        async with self._lock:
+            sql = "SELECT * FROM interest_topic"
+            args: list[Any] = []
+            if status:
+                sql += " WHERE status=?"
+                args.append(status)
+            sql += " ORDER BY last_mentioned DESC LIMIT ?"
+            args.append(max(1, int(limit)))
+            rows = self.conn.execute(sql, args).fetchall()
+            return [self._interest_topic_row(row) for row in rows]
+
+    async def interest_facts(self, topic_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM interest_fact WHERE topic_id=? ORDER BY confidence DESC, created_at DESC LIMIT ?",
+                (str(topic_id), max(1, int(limit))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    async def interest_fact_counts(self) -> dict[str, int]:
+        async with self._lock:
+            rows = self.conn.execute(
+                "SELECT topic_id, COUNT(*) AS n FROM interest_fact GROUP BY topic_id"
+            ).fetchall()
+            return {str(row["topic_id"]): int(row["n"]) for row in rows}
+
+    async def topics_needing_enrichment(self, now: float, *, limit: int = 3,
+                                        cooldown_hours: int = 12) -> list[dict[str, Any]]:
+        """挑需要联网补知识的主题：活跃、近期提过、还没补过或补得够久。"""
+        cutoff = float(now) - max(1, int(cooldown_hours)) * 3600
+        async with self._lock:
+            rows = self.conn.execute(
+                """SELECT * FROM interest_topic
+                WHERE status='active' AND last_enriched_at<?
+                ORDER BY mention_count DESC, last_mentioned DESC LIMIT ?""",
+                (cutoff, max(1, int(limit))),
+            ).fetchall()
+            return [self._interest_topic_row(row) for row in rows]
+
+    async def mark_interest_enriched(self, topic_id: str, now: float) -> None:
+        async with self._lock:
+            with self._tx() as conn:
+                conn.execute("UPDATE interest_topic SET last_enriched_at=? WHERE id=?",
+                             (float(now), str(topic_id)))
+
+    async def add_interest_note(self, topic_id: str, note: str, now: float | None = None) -> bool:
+        """大肥鱼自己的看法，一天一个主题最多一条。"""
+        text = " ".join(str(note or "").split())[:600]
+        if not topic_id or not text:
+            return False
+        stamp = float(now or time.time())
+        note_id = hashlib.sha256(f"{topic_id}:{int(stamp // 86400)}".encode()).hexdigest()[:24]
+        async with self._lock:
+            with self._tx() as conn:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO interest_note(id,topic_id,note,created_at) VALUES(?,?,?,?)",
+                    (note_id, str(topic_id), text, stamp),
+                )
+                return bool(cursor.rowcount)
+
+    async def interest_notes(self, topic_id: str, limit: int = 5) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM interest_note WHERE topic_id=? ORDER BY created_at DESC LIMIT ?",
+                (str(topic_id), max(1, int(limit))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    async def decay_interest(self, now: float, *, cooling_days: int = 30, archive_days: int = 90) -> int:
+        """长期不提的兴趣降级：先冷却（不注入），再归档。返回受影响行数。"""
+        stamp = float(now)
+        cooling = stamp - max(1, int(cooling_days)) * 86400
+        archive = stamp - max(1, int(archive_days)) * 86400
+        async with self._lock:
+            with self._tx() as conn:
+                changed = conn.execute(
+                    "UPDATE interest_topic SET status='cooling' WHERE status='active' AND last_mentioned<?",
+                    (cooling,),
+                ).rowcount
+                changed += conn.execute(
+                    "UPDATE interest_topic SET status='archived' WHERE status='cooling' AND last_mentioned<?",
+                    (archive,),
+                ).rowcount
+                return int(changed or 0)
 
     async def save_scene(self, framework_id: str, scene: str, deltas: dict[str, Any], opportunities: list[dict[str, Any]]) -> None:
         async with self._lock:

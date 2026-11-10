@@ -28,6 +28,7 @@ from .core.storage import LifeStore,RECORD_RETENTION_DAYS
 from .information.information_service import InformationService
 from .life.bedtime import BEDTIME_LOOP_SECONDS,BEDTIME_SILENCE_MINUTES,BedtimeManager
 from .life.continuity import ContinuityService
+from .life.interest_service import InterestService
 from .life.life_state import LifeStateEngine
 from .life.memory_service import LUNAR_AVAILABLE,MemoryService
 from .life.proactive import ProactiveEngine
@@ -409,6 +410,8 @@ class MaiLifePlugin(MaiBotPlugin):
         self._continuity=ContinuityService(self._store,self.config,self._llm,self.ctx.logger)
         self._memory=MemoryService(self._store,self.config,self._llm,self.ctx.logger,bot_name=self._bot_name)
         self._information=InformationService(self.ctx,self._store,self.config,self._llm,self.ctx.logger,bot_name=self._bot_name)
+        self._interest=InterestService(self._store,self.config,self._llm,self.ctx.logger,
+                                       self._information.search,bot_name=self._bot_name)
         self._group_observer=GroupObserver(self._store,self.config,self._llm,self.ctx.logger)
         self._relay=RelayService(self.ctx,self._store,self.config,self.ctx.logger,bot_name=self._bot_name)
         self._bookshelf=BookshelfService(self._store,self.config)
@@ -462,8 +465,8 @@ class MaiLifePlugin(MaiBotPlugin):
         if scope=="self":
             for service in (self._llm,self._env,self._state,self._schedule,self._rest,self._proactive,
                             self._continuity,self._memory,self._information,
-                            self._group_observer,self._relay,self._bookshelf,self._creation,self._admin,
-                            self._bedtime):
+                            self._interest,self._group_observer,self._relay,self._bookshelf,
+                            self._creation,self._admin,self._bedtime):
                 if service:service.update_config(self.config)
             if self._store:await self._store.sync_users(self.config.users.profiles)
             await self._check_drawpic()
@@ -626,6 +629,12 @@ class MaiLifePlugin(MaiBotPlugin):
                                        timeout=MAINTENANCE_MEMORY_TIMEOUT)
             except TimeoutError:
                 self.ctx.logger.warning("[MaiLife] 每日记忆（日记/日期）超时，下一 tick 重试")
+            # 兴趣补知识只在配置时段内真正联网，其余 tick 直接返回；衰减失败不影响主链。
+            try:
+                await self._interest.enrich_due(now)
+                await self._interest.decay(now)
+            except Exception as exc:
+                self.ctx.logger.warning(f"[MaiLife] 兴趣库维护失败: {exc}")
 
     def _check_wake_catchup(self,now:datetime,state:dict[str,Any])->None:
         """晨间自然醒来（sleep/nap→awake，04:00-11:00）且补读开启时，派发一次性补读任务（transient 不阻塞 tick）。"""
@@ -1367,6 +1376,11 @@ class MaiLifePlugin(MaiBotPlugin):
             )
         # 连续话题与日期提取不阻塞当前回复。
         self._spawn_transient(self._continuity.refresh(uid,intent),f"mai-life-continuity-{uid}")
+        # 兴趣抽取同样是旁路任务：只学白名单用户的私聊，命中兴趣信号才花一次模型调用。
+        self._spawn_transient(
+            self._interest.observe_message(uid,text,self._env.now(),source_message_id=mid,is_private=True),
+            f"mai-life-interest-{uid}",
+        )
         self._spawn_transient(
             self._memory.observe_message(uid,text,self._env.now(),source_message_id=mid),
             f"mai-life-date-{uid}",
@@ -1388,7 +1402,7 @@ class MaiLifePlugin(MaiBotPlugin):
         moment_signal=await self._detect_moment_signal(uid,text)
         if session:
             self._session_runtime[session]={"user_id":uid,"message_id":mid,
-                                            "intent":intent,"media":media,
+                                            "intent":intent,"media":media,"text":text[:240],
                                             "moment_signal":moment_signal,
                                             "platform":str(merged.get("platform") or "qq"),"adapter":adapter_name(merged),
                                             "chat_type":"private","updated_at":time.time()}
@@ -1454,6 +1468,7 @@ class MaiLifePlugin(MaiBotPlugin):
                 "bookshelf":await self._cached_block("bookshelf",user["user_id"],now,
                                                      self._bookshelf.context_for_user,user),
                 "dream":await self._cached_block("dream","",now,self._store.latest_dream),
+                "interest":await self._interest.context_for(str(runtime.get("text") or ""),now),
                 "bedtime":bedtime}
 
     @staticmethod
@@ -1553,7 +1568,8 @@ class MaiLifePlugin(MaiBotPlugin):
                 stable,volatile=self._prompts.planner_split(payload["state"],payload["weather"],payload["context"],payload["user"],payload["dream"],
                                                             payload["backlogs"],payload["environment"],payload["continuity"],payload["intent"],
                                                             int(self.config.context.prompt_max_chars),memory=payload["memory"],information=payload["information"],
-                                                            bookshelf=payload["bookshelf"],bot_name=self._bot_name,bedtime=payload["bedtime"])
+                                                            bookshelf=payload["bookshelf"],interest=payload.get("interest"),
+                                                            bot_name=self._bot_name,bedtime=payload["bedtime"])
         if active:
             # reply 的 msg_id 必须引用会话最近一条真实用户消息：proactive:xxx 任务编号宿主 reply 工具
             # 查不到（find_source_message_by_id 不认），报错还会被 to_display_message_id 哈希成乱码。
@@ -1599,7 +1615,8 @@ class MaiLifePlugin(MaiBotPlugin):
                 suffix=self._prompts.replyer(payload["state"],payload["weather"],payload["context"],payload["user"],payload["backlogs"],
                                              payload["environment"],payload["continuity"],payload["intent"],
                                              min(2400,int(self.config.context.prompt_max_chars)),memory=payload["memory"],information=payload["information"],
-                                             bookshelf=payload["bookshelf"],bot_name=self._bot_name,bedtime=payload["bedtime"],
+                                             bookshelf=payload["bookshelf"],interest=payload.get("interest"),
+                                             bot_name=self._bot_name,bedtime=payload["bedtime"],
                                              detail=str(self.config.context.replyer_detail))
         if active and active.kind=="relay" and self._relay and self.config.group.relay_enabled:
             suffix+=await self._relay.prompt_context(session,active.task_id)

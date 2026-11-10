@@ -83,6 +83,8 @@ class LLMService:
             "creation_body": models.creation_body_task or models.creative_task,
             "creation_review": models.creation_review_task or models.reasoning_task,
             "reading_annotation": models.reading_annotation_task or models.creative_task,
+            # 兴趣抽取/补知识是结构化短任务，走快模型即可；未配置时也回落到快模型。
+            "interest": models.fast_task,
         }
         return str(routes.get(kind) or models.reasoning_task or "planner").strip()
 
@@ -105,6 +107,10 @@ class LLMService:
             kinds.update({"creation_outline","creation_body","creation_review"})
             if self.config.creation.external_reading_enabled and self.config.creation.reading_annotation_enabled:
                 kinds.add("reading_annotation")
+        # 兴趣库只在配了学习对象时才可能调用模型，避免空配置把启动健康检查拖成失败。
+        interest=getattr(self.config,"interest",None)
+        if interest is not None and interest.enabled and interest.owner_qq_list:
+            kinds.add("interest")
         return kinds
 
     async def refresh_health(self) -> set[str]:
