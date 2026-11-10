@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 # 长期运行记录（互动、主动事件、契机、转述候选/事件、跳过统计）的保留天数。
 # 这些表没有过期字段驱动的外部清理，超期行必须在 cleanup_runtime_records 中删除，
 # 否则只会无限增长；pending 与在途行永远保留，避免打断正在结算的引用。
@@ -188,6 +188,16 @@ class LifeStore:
               end_minute INTEGER NOT NULL, kind TEXT NOT NULL, summary TEXT NOT NULL,
               location TEXT NOT NULL, energy_load REAL NOT NULL, shareability REAL NOT NULL
             );
+            -- 真实活动流水：只有写进这张表的事，才允许被当成"此刻正在做"对外叙述。
+            -- schedule_node_id 非空表示已回填到当天框架，避免同一条活动重复回填。
+            CREATE TABLE IF NOT EXISTS activity_log(
+              id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+              title TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+              source_urls TEXT NOT NULL DEFAULT '[]',
+              started_at REAL NOT NULL, ended_at REAL NOT NULL DEFAULT 0,
+              schedule_node_id TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_log_started ON activity_log(started_at);
             CREATE INDEX IF NOT EXISTS idx_framework_day ON daily_framework(day,start_minute);
             CREATE TABLE IF NOT EXISTS detailed_scenes(
               framework_id TEXT PRIMARY KEY, scene TEXT NOT NULL,
@@ -522,6 +532,8 @@ class LifeStore:
             self._migrate_to_v13()
         if version < 14:
             self._migrate_to_v14()
+        if version < 15:
+            self._migrate_to_v15()
         self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(SCHEMA_VERSION),))
         now = time.time()
         self.conn.execute(
@@ -615,6 +627,15 @@ class LifeStore:
     def _migrate_to_v14(self) -> None:
         """v14 为睡眠相位增加睡前推迟点；幂等补列，不改动任何旧数据（含书柜）。"""
         self._ensure_column("sleep_runtime","sleep_defer_until","REAL NOT NULL DEFAULT 0")
+
+    def _migrate_to_v15(self) -> None:
+        """v15 引入真实活动流水，并给框架节点补「真实/生成」标记与活动外键。
+
+        新表由 CREATE TABLE IF NOT EXISTS 幂等创建；节点两个新列默认按"生成"处理，
+        旧数据语义不变（旧节点本来就是模型生成的）。
+        """
+        self._ensure_column("daily_framework","node_source","TEXT NOT NULL DEFAULT 'generated'")
+        self._ensure_column("daily_framework","activity_id","TEXT NOT NULL DEFAULT ''")
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         """幂等补充 SQLite 列，避免测试阶段升级时覆盖已有生活数据。"""
@@ -780,9 +801,11 @@ class LifeStore:
                     conn.execute(f"DELETE FROM detailed_scenes WHERE framework_id IN ({marks})", old_ids)
                 conn.execute("DELETE FROM daily_framework WHERE day=?", (day,))
                 conn.executemany(
-                    """INSERT INTO daily_framework(id,day,start_minute,end_minute,kind,summary,location,energy_load,shareability,source)
-                    VALUES(:id,:day,:start_minute,:end_minute,:kind,:summary,:location,:energy_load,:shareability,:source)""",
-                    [dict(node,source=clean_source) for node in nodes],
+                    """INSERT INTO daily_framework(id,day,start_minute,end_minute,kind,summary,location,energy_load,shareability,source,node_source,activity_id)
+                    VALUES(:id,:day,:start_minute,:end_minute,:kind,:summary,:location,:energy_load,:shareability,:source,:node_source,:activity_id)""",
+                    [dict(node,source=clean_source,
+                          node_source=str(node.get("node_source") or "generated"),
+                          activity_id=str(node.get("activity_id") or "")) for node in nodes],
                 )
 
     async def get_framework(self, day: str) -> list[dict[str, Any]]:
@@ -791,6 +814,98 @@ class LifeStore:
                 "SELECT * FROM daily_framework WHERE day=? ORDER BY start_minute", (day,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    async def update_framework_node(self, day: str, node_id: str, *, summary: str = "",
+                                    location: str = "", node_source: str = "",
+                                    activity_id: str = "") -> None:
+        """把某个框架节点改写为真实活动回填版本；只更新传入的字段。"""
+        sets = []
+        values: list[Any] = []
+        if summary:
+            sets.append("summary=?"); values.append(str(summary)[:160])
+        if location:
+            sets.append("location=?"); values.append(str(location)[:80])
+        if node_source:
+            sets.append("node_source=?"); values.append(str(node_source))
+        if activity_id:
+            sets.append("activity_id=?"); values.append(str(activity_id))
+        if not sets:
+            return
+        values.extend([day, node_id])
+        async with self._lock:
+            with self._tx() as conn:
+                conn.execute(
+                    f"UPDATE daily_framework SET {', '.join(sets)} WHERE day=? AND id=?", values
+                )
+
+    async def add_activity(self, item: dict[str, Any]) -> bool:
+        """写入一条真实活动；同一 id 重复写入静默忽略（调用方负责生成稳定 id）。"""
+        activity_id = str(item.get("id") or "").strip()
+        if not activity_id:
+            return False
+        started = float(item.get("started_at") or 0) or time.time()
+        async with self._lock:
+            with self._tx() as conn:
+                cursor = conn.execute(
+                    """INSERT OR IGNORE INTO activity_log
+                    (id,kind,title,summary,source_urls,started_at,ended_at,schedule_node_id,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (
+                        activity_id,
+                        str(item.get("kind") or "")[:40],
+                        str(item.get("title") or "")[:200],
+                        str(item.get("summary") or "")[:2000],
+                        json.dumps(item.get("source_urls") or [], ensure_ascii=False),
+                        started,
+                        float(item.get("ended_at") or 0),
+                        str(item.get("schedule_node_id") or ""),
+                        float(item.get("created_at") or time.time()),
+                    ),
+                )
+                return bool(cursor.rowcount)
+
+    @staticmethod
+    def _activity_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        data = dict(row)
+        try:
+            data["source_urls"] = json.loads(data.get("source_urls") or "[]")
+        except (TypeError, ValueError):
+            data["source_urls"] = []
+        return data
+
+    async def activities_between(self, start: float, end: float) -> list[dict[str, Any]]:
+        """按时间窗读取真实活动，供日程回填与日记取材。"""
+        async with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM activity_log WHERE started_at>=? AND started_at<? ORDER BY started_at",
+                (float(start), float(end)),
+            ).fetchall()
+            return [self._activity_row(row) for row in rows]
+
+    async def recent_activities(self, limit: int = 20) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM activity_log ORDER BY started_at DESC LIMIT ?", (max(1, int(limit)),)
+            ).fetchall()
+            return [self._activity_row(row) for row in rows]
+
+    async def unscheduled_activities(self, since: float, limit: int = 50) -> list[dict[str, Any]]:
+        """尚未回填到框架的活动，按时间正序返回。"""
+        async with self._lock:
+            rows = self.conn.execute(
+                """SELECT * FROM activity_log
+                WHERE started_at>=? AND schedule_node_id='' ORDER BY started_at LIMIT ?""",
+                (float(since), max(1, int(limit))),
+            ).fetchall()
+            return [self._activity_row(row) for row in rows]
+
+    async def mark_activity_scheduled(self, activity_id: str, node_id: str) -> None:
+        async with self._lock:
+            with self._tx() as conn:
+                conn.execute(
+                    "UPDATE activity_log SET schedule_node_id=? WHERE id=?",
+                    (str(node_id), str(activity_id)),
+                )
 
     async def save_scene(self, framework_id: str, scene: str, deltas: dict[str, Any], opportunities: list[dict[str, Any]]) -> None:
         async with self._lock:

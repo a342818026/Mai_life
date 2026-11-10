@@ -221,6 +221,14 @@ class InformationService:
             "relevance_score":association["score"],"relevance_reason":association["reason"],
             "opportunity_id":opportunity_id,"expires_at":now_ts+int(cfg.search_note_retention_days)*86400,
         })
+        # 真实活动流水：查资料是确实发生的事，日程回填与日记都从这里取材。
+        await self.store.add_activity({
+            "id":f"explore:{note_id}","kind":"exploration",
+            "title":str(plan["topic"] or query)[:120],
+            "summary":str(summary)[:2000],
+            "source_urls":[item["url"] for item in results if item["url"]][:5],
+            "started_at":now_ts,
+        })
         return True
 
     async def _summarize_search(self,plan:dict[str,str],results:list[dict[str,Any]])->str:

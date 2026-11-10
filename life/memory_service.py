@@ -249,13 +249,18 @@ class MemoryService:
         day=target.isoformat(); start,end=self._day_bounds(now,target)
         scenes=await self.store.scenes_for_day(day); dreams=await self.store.dreams_between(start,end)
         interactions=await self.store.interaction_counts(start,end)
+        # 真实活动流水：日记里"做过什么"只能来自这里，没记录的事不许编。
+        activities=await self.store.activities_between(start,end)
         total_interactions=sum(int(item.get("count") or 0) for item in interactions)
         active_users=len({str(item.get("user_id") or "") for item in interactions if item.get("user_id")})
         life=[{"kind":item.get("kind"),"summary":item.get("summary"),"location":item.get("location"),
                "scene":item.get("scene") or ""} for item in scenes]
         dream_text=[{"summary":item.get("content"),"fragments":item.get("fragments") or []} for item in dreams]
         # 输入模型的互动信息只有总量和人数，避免日记成为另一份私聊记录。
+        real_activities=[{"kind":str(item.get("kind") or ""),"title":str(item.get("title") or "")[:120]}
+                         for item in activities[:12] if str(item.get("title") or "").strip()]
         source={"day":day,"life":life,"dreams":dream_text,
+                "real_activities":real_activities,
                 "interaction_counts":{"total":total_interactions,"active_people":active_users}}
         serialized=json.dumps(source,ensure_ascii=False,sort_keys=True); digest=hashlib.sha256(serialized.encode()).hexdigest()
         summaries=[str(item.get("summary") or "") for item in life if item.get("summary")]
@@ -269,7 +274,10 @@ class MemoryService:
         if self.llm.task_available("diary"):
             prompt=(
                 f"根据以下{self.bot_name}自己的生活数据写一篇第一人称抽象日记。不得补写聊天原句、用户姓名、群名、账号、密码或朋友隐私。"
-                "互动数据只有数量，不能猜测聊天内容。返回JSON：title、content、mood_summary。\n"+serialized
+                "互动数据只有数量，不能猜测聊天内容。"
+                "real_activities 里记的是当天确实做过的事，可以写；没记进去的具体事务一律不得编造，"
+                "其余时间只按生活基调和心情写，不要虚构看了什么、去了哪里、做了什么。"
+                "返回JSON：title、content、mood_summary。\n"+serialized
             )
             raw=await self.llm.generate_json_retry(
                 prompt,"你写克制、自然的私人日记，只输出合法JSON。",fallback,max_tokens=0,

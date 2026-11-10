@@ -51,6 +51,24 @@ class LifeStateEngine:
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low,min(high,value))
 
+    @staticmethod
+    def _honest_activity(segment: dict[str,Any]|None, scene: dict[str,Any]|None) -> str:
+        """当前活动只允许两种口径：真实活动照实说，生成时段只给基调。
+
+        current_activity 会被注入对话背景，写成"在图书馆自习"就等于替模型造了一件
+        没发生过的事。这里把非真实节点降级为基调描述，模型再怎么发挥也不会变成
+        "我正在做某件具体的事"。
+        """
+        node=segment or {}
+        if str(node.get("node_source") or "generated")=="real":
+            return str((scene or {}).get("scene") or node.get("summary") or "有件正在做的事")
+        kind=str(node.get("kind") or "")
+        tone={"sleep":"正在睡觉","nap":"在打盹","rest":"歇着，没什么具体安排",
+              "meal":"在吃饭或准备吃饭","work":"有事要处理，但此刻没有可确认的具体进展",
+              "study":"想静下来看点东西，没有确定在做什么","leisure":"闲着，随手找点乐子",
+              "travel":"在移动路上"}.get(kind,"没什么具体安排")
+        return tone
+
     def _cycle_offset(self, now: datetime) -> int | None:
         """返回距周期起始日的天数（取模周期长度）；未启用或未配置时返回 None。"""
         cfg=self.config.state
@@ -148,7 +166,7 @@ class LifeStateEngine:
             state["health_status"]="normal"; state["health_note"]="状态正常"
         state["sleep_phase"]=runtime["phase"]
         state["current_location"]=str((segment or {}).get("location") or state.get("current_location") or "家里")
-        state["current_activity"]=str((scene or {}).get("scene") or (segment or {}).get("summary") or "自由活动")
+        state["current_activity"]=self._honest_activity(segment,scene)
         state["body_cycle"]=self._body_cycle(now)
         state["last_updated_at"]=now_ts
         runtime["last_event"]=runtime.get("last_event","")

@@ -13,6 +13,12 @@ from typing import Any
 
 _ALLOWED={"meal","work","study","travel","leisure","sleep","nap","rest"}
 
+# 真实活动类型 → 日程摘要前缀。只有这些类型才可能把节点标记成 node_source='real'。
+_ACTIVITY_LABELS={
+    "news":"读新闻","exploration":"查资料","reading":"读书",
+    "creation":"写东西","weather":"看天气","market":"看行情",
+}
+
 # 身份信号只从人格串里读已经写明的内容，不替用户假定身份；不同人的麦麦身份不同。
 _IDENTITY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("学生", "大学", "本科", "研究生", "硕士", "博士", "在读", "留学生",
@@ -332,6 +338,44 @@ class ScheduleService:
             blocks.append("最近几天的安排（时间结构可以相似，具体内容必须明显错开）：\n"+"\n".join(recent))
         return "\n".join(blocks)
 
+    # 真实活动回填：只有 activity_log 里确实发生过的事，才能写进日程当成"正在做"。
+    async def sync_activities(self, now: datetime, nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把真实活动回填到当天框架的对应时段，并把节点标记为 node_source='real'。
+
+        只改写已排好的时段，不为空白时间凭空造节点——时间结构仍由生成负责，
+        这里只做一件事：让真实发生的事覆盖掉同段的编造内容。
+        幂等：活动记录里存了 schedule_node_id，节点还在就不重复改写；
+        当天框架被强制重生成（节点 ID 变了）时会重新回填。
+        """
+        if not nodes: return nodes
+        day=now.strftime("%Y-%m-%d")
+        day_start=datetime.combine(now.date(),datetime.min.time(),tzinfo=now.tzinfo)
+        day_end=day_start+timedelta(days=1)
+        # 往前多看 6 小时：跨零点前后的活动仍归到它实际发生的那一天。
+        activities=await self.store.activities_between((day_start-timedelta(hours=6)).timestamp(),day_end.timestamp())
+        if not activities: return nodes
+        existing={str(node.get("id") or "") for node in nodes}
+        changed=False
+        for item in activities:
+            if str(item.get("schedule_node_id") or "") in existing: continue
+            started=datetime.fromtimestamp(float(item.get("started_at") or 0),tz=now.tzinfo)
+            if started.strftime("%Y-%m-%d")!=day: continue
+            title=" ".join(str(item.get("title") or "").split())[:120]
+            if not title: continue
+            minute=int((started-day_start).total_seconds()//60)
+            node=next((n for n in nodes if int(n["start_minute"])<=minute<int(n["end_minute"])),None)
+            if node is None: continue   # 没有对应时段就放弃，不硬塞
+            label=_ACTIVITY_LABELS.get(str(item.get("kind") or ""),"做自己的事")
+            await self.store.update_framework_node(
+                day,str(node["id"]),summary=f"{label}：{title}",node_source="real",
+                activity_id=str(item.get("id") or ""),
+            )
+            await self.store.mark_activity_scheduled(str(item.get("id") or ""),str(node["id"]))
+            node["summary"]=f"{label}：{title}"; node["node_source"]="real"
+            node["activity_id"]=str(item.get("id") or ""); changed=True
+        if changed: return await self.store.get_framework(day)
+        return nodes
+
     async def ensure_day(self, now: datetime, personality: str, weather_text: str, force: bool=False,
                          memory_context: dict[str,Any]|None=None,
                          environment: dict[str,Any]|None=None) -> list[dict[str, Any]]:
@@ -402,7 +446,11 @@ class ScheduleService:
             nodes=self._validate(day,raw,state)
         source="fallback" if not nodes else "llm"
         if not nodes:nodes=fallback
-        await self.store.replace_framework(day,nodes,source=source); return await self.store.get_framework(day)
+        # 模型生成或骨架回落出来的节点一律按"非事实"入库；真实活动随后由 sync_activities 覆盖。
+        for node in nodes:
+            node["node_source"]="generated"; node["activity_id"]=""
+        await self.store.replace_framework(day,nodes,source=source)
+        return await self.sync_activities(now,await self.store.get_framework(day))
 
     @staticmethod
     def current_and_next(nodes: list[dict[str, Any]], minute: int) -> tuple[dict[str, Any]|None,dict[str, Any]|None]:
@@ -421,12 +469,15 @@ class ScheduleService:
         for node in due:
             if await self.store.get_scene(node["id"]): continue
             expires=datetime.combine(now.date(),datetime.min.time(),tzinfo=now.tzinfo)+timedelta(minutes=node["end_minute"])
+            real=str(node.get("node_source") or "")=="real"
             fallback={"scene":node["summary"],"state_deltas":self._state_deltas(node),
                       "opportunities":([{"topic":node["summary"],"motive":"想自然分享一点正在经历的生活","weight":node["shareability"],"privacy":"normal"}] if node["shareability"]>=0.35 else [])}
             prompt=(f"把生活框架细化为具体但克制的场景。框架：{json.dumps(node,ensure_ascii=False)}\n"
                     f"人格：{self._personality or '自然、独立、有自己的生活'}\n"
                     f"当前精力{state.get('energy')}、饥饿{state.get('hunger')}、天气{weather_text}。\n"
-                    "返回JSON对象：scene字符串和opportunities数组。机会字段topic,motive,weight。"
+                    + (f"该时段已确认真实发生了「{node['summary']}」，场景必须围绕这件事展开，"
+                       "不得改写成别的活动，也不得补充未发生的细节。\n" if real else "")
+                    + "返回JSON对象：scene字符串和opportunities数组。机会字段topic,motive,weight。"
                     "场景必须与人格身份一致（学生写在校场景，职场写工位场景），不要凭空制造重大事件，不要强行想用户。")
             raw=await self._generate_with_retry(prompt,"你是日常场景细化器，只返回JSON对象。",fallback,
                 task_kind="scene_detail",request_type="scene_detail",

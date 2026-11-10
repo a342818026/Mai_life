@@ -50,6 +50,7 @@ class NewsService:
         contents=await self._read_articles(results)
         changed=0; now_ts=now.timestamp(); retention=int(cfg.news_retention_days)*86400
         service=str(response.get("service") or "host")
+        saved_titles:list[str]=[]; saved_urls:list[str]=[]
         for index,result in enumerate(results):
             uncited=not result["url"]
             summary=result["snippet"]
@@ -64,7 +65,18 @@ class NewsService:
                 "id":item_id,"source_id":source_id,"title":result["title"],"url":result["url"],
                 "summary":summary,"content":content,"published_at":now_ts,"fetched_at":now_ts,
                 "content_hash":digest,"expires_at":now_ts+retention,
-            }):changed+=1
+            }):
+                changed+=1; saved_titles.append(str(result["title"])[:120])
+                if result["url"]: saved_urls.append(str(result["url"]))
+        if changed:
+            # 真实活动流水：读新闻是确实发生的事，日程与日记都从这里取材。
+            digest=hashlib.sha1("|".join(saved_titles[:5]).encode()).hexdigest()[:16]
+            await self.store.add_activity({
+                "id":f"news:{now.strftime('%Y-%m-%d')}:{digest}","kind":"news",
+                "title":"、".join(title[:40] for title in saved_titles[:3]),
+                "summary":"这次读到的新闻："+"；".join(saved_titles[:5]),
+                "source_urls":saved_urls[:5],"started_at":now_ts,
+            })
         return changed
 
     @staticmethod

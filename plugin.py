@@ -596,6 +596,12 @@ class MaiLifePlugin(MaiBotPlugin):
             except TimeoutError:
                 self.ctx.logger.warning("[MaiLife] 日程生成超时，本 tick 跳过细化与每日记忆")
                 return
+            # 真实活动回填：联网见闻/创作巡检往 activity_log 写了新内容后，尽快落到当日框架，
+            # 让"当前时段"从"只是基调"变成"已确认真实发生"。
+            try:
+                nodes=await self._schedule.sync_activities(now,nodes)
+            except Exception as exc:
+                self.ctx.logger.warning(f"[MaiLife] 真实活动回填失败: {exc}")
             context=await self._schedule.context(now); state=await self._store.get_state()
             try:
                 await asyncio.wait_for(

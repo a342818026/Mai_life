@@ -219,6 +219,14 @@ class CreationService:
                                                             summary=summary,privacy=privacy,status="archived",now=now.timestamp())
             await self.store.mark_creation_inspiration(str(inspiration["id"]),"consumed")
             await self.store.finish_creation_run(run_id,"archived",now.timestamp())
+            # 真实活动流水：写完一篇作品是确实发生的事，日程与日记都从这里取材。
+            try:
+                await self.store.add_activity({
+                    "id":f"creation:{document_id}:{chapter_number if continuation else 0}","kind":"creation",
+                    "title":str((book or {}).get("title") or outline.get("title") or "未命名作品")[:120],
+                    "summary":str(summary)[:2000],"started_at":now.timestamp(),
+                })
+            except Exception as exc:self.logger.debug(f"[MaiLife] 创作活动流水写入失败: {exc}")
             try:await self.store.record_mood_event("creation_archived",now)
             except Exception as exc:self.logger.debug(f"[MaiLife] 心情事件记录失败: {exc}")
             if continuation:
