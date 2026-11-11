@@ -1,18 +1,3 @@
-## 1.29.0
-
-新增海龟汤主持人。
-
-- 题库：合并 ZeroTang05/Situation-Puzzle（446 题，自带 3 条提示与难度）与
-  KONPiGG/astrbot_plugin_soupai（289 题，去重后 186 题），共 **632 题**，按敏感度分
-  light/mid/heavy 三级，`assets/puzzles_zh.json` 随包下发
-- `GameService`：会话级单局状态机。开局出汤面、提问判定、提示递增、猜中收官、超时收摊
-- 判定只允许 `yes/no/irrelevant/partly` 四类，映射成「是 / 不是 / 无关 / 是也不是」；
-  越界输出一律降级为「无关」，另有汤底长片段检测兜底，防止泄底
-- 存储 v19：`game_rounds`（单局状态）、`game_turns`（问答流水）、`puzzle_played`（已玩记录，
-  抽样避开已玩题目）
-- 群聊走底层发送层，不受私聊命令权限限制；`private_enabled` 默认关闭
-- 题库分级默认只出 light，mid/heavy 需在配置里显式放开
-
 ## 1.28.0
 
 日程的定位换了：不再生成「我今天在做什么」，改成「被动记录」——只记聊天里被派给的活。

@@ -360,29 +360,3 @@ proactive_enabled = true
 
 # 多少天内的事项仍算进行中。
 active_days = 14
-
-[game]
-# 海龟汤主持人：会话级单局，判定只回答是/不是/无关，汤底不对外。
-enabled = true
-
-# 是否允许在群聊开局。
-group_enabled = true
-
-# 是否允许在私聊开局（默认关闭）。
-private_enabled = false
-
-# 允许出的题目分级：light 常规、mid 含死亡情节、heavy 血腥恐怖。
-# 群里建议只留 light；要重口味自行加，风险自负。
-allow_ratings = ["light"]
-
-# 限定难度 easy/medium/hard，留空表示不限。
-difficulty = ""
-
-# 一局最多几个问题，超过自动揭底。
-max_questions = 60
-
-# 多久没人问自动收摊（分钟）。
-round_timeout_minutes = 90
-
-# 题库文件（插件 assets 目录内）。
-library_file = "assets/puzzles_zh.json"

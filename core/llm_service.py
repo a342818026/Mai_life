@@ -87,8 +87,6 @@ class LLMService:
             "interest": models.fast_task,
             # 被动日程抽取同理：短结构化任务。
             "commitment": models.fast_task,
-            # 海龟汤判定：只需四选一，走快模型。
-            "puzzle_judge": models.fast_task,
         }
         return str(routes.get(kind) or models.reasoning_task or "planner").strip()
 
@@ -119,9 +117,6 @@ class LLMService:
         commitment=getattr(self.config,"commitment",None)
         if commitment is not None and commitment.enabled and commitment.owner_qq_list:
             kinds.add("commitment")
-        game=getattr(self.config,"game",None)
-        if game is not None and game.enabled:
-            kinds.add("puzzle_judge")
         return kinds
 
     async def refresh_health(self) -> set[str]:

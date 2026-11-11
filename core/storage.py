@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 18
 # 长期运行记录（互动、主动事件、契机、转述候选/事件、跳过统计）的保留天数。
 # 这些表没有过期字段驱动的外部清理，超期行必须在 cleanup_runtime_records 中删除，
 # 否则只会无限增长；pending 与在途行永远保留，避免打断正在结算的引用。
@@ -234,31 +234,6 @@ class LifeStore:
             );
             CREATE INDEX IF NOT EXISTS idx_commitment_status ON commitments(status,created_at);
             CREATE INDEX IF NOT EXISTS idx_commitment_content ON commitments(content);
-            -- 海龟汤（v19）：会话级单局、问答流水、已玩记录。汤底只在本进程内使用，标注可见性。
-            CREATE TABLE IF NOT EXISTS game_rounds(
-              session_id TEXT PRIMARY KEY,
-              puzzle_id TEXT NOT NULL,
-              scope TEXT NOT NULL DEFAULT 'group',
-              group_id TEXT NOT NULL DEFAULT '',
-              user_id TEXT NOT NULL DEFAULT '',
-              phase TEXT NOT NULL DEFAULT 'active',
-              hints_used INTEGER NOT NULL DEFAULT 0,
-              question_count INTEGER NOT NULL DEFAULT 0,
-              started_at REAL NOT NULL,
-              updated_at REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_game_round_phase ON game_rounds(phase,updated_at);
-            CREATE TABLE IF NOT EXISTS game_turns(
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              session_id TEXT NOT NULL, user_id TEXT NOT NULL DEFAULT '',
-              kind TEXT NOT NULL, text TEXT NOT NULL, verdict TEXT NOT NULL DEFAULT '',
-              created_at REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_game_turn_session ON game_turns(session_id,created_at);
-            CREATE TABLE IF NOT EXISTS puzzle_played(
-              puzzle_id TEXT PRIMARY KEY, session_id TEXT NOT NULL DEFAULT '',
-              played_at REAL NOT NULL
-            );
             CREATE INDEX IF NOT EXISTS idx_framework_day ON daily_framework(day,start_minute);
             CREATE TABLE IF NOT EXISTS detailed_scenes(
               framework_id TEXT PRIMARY KEY, scene TEXT NOT NULL,
@@ -599,8 +574,6 @@ class LifeStore:
             self._migrate_to_v17()
         if version < 18:
             self._migrate_to_v18()
-        if version < 19:
-            self._migrate_to_v19()
         self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(SCHEMA_VERSION),))
         now = time.time()
         self.conn.execute(
@@ -703,9 +676,6 @@ class LifeStore:
         """
         self._ensure_column("daily_framework","node_source","TEXT NOT NULL DEFAULT 'generated'")
         self._ensure_column("daily_framework","activity_id","TEXT NOT NULL DEFAULT ''")
-
-    def _migrate_to_v19(self) -> None:
-        """v19 海龟汤：三张表由建表语句幂等创建，无历史数据需要回填。"""
 
     def _migrate_to_v18(self) -> None:
         """v18 被动日程：commitments 表由建表语句幂等创建，不做历史回填。
@@ -1010,95 +980,6 @@ class LifeStore:
             )
             self.conn.commit()
             return cursor.rowcount == 1
-
-    # ---- 海龟汤：单局状态、问答流水、已玩记录 ----
-    async def start_game_round(self, session_id: str, puzzle_id: str, *, scope: str = "group",
-                               group_id: str = "", user_id: str = "", now: float = 0) -> bool:
-        """开一局；同一会话已有进行中的局时不覆盖，返回 False。"""
-        now = float(now or time.time())
-        async with self._lock:
-            existing = self.conn.execute(
-                "SELECT puzzle_id FROM game_rounds WHERE session_id=? AND phase='active'", (session_id,)
-            ).fetchone()
-            if existing:
-                return False
-            self.conn.execute(
-                """INSERT OR REPLACE INTO game_rounds
-                (session_id,puzzle_id,scope,group_id,user_id,phase,hints_used,question_count,started_at,updated_at)
-                VALUES(?,?,?,?,?,'active',0,0,?,?)""",
-                (session_id, puzzle_id, scope, group_id, user_id, now, now),
-            )
-            self.conn.commit()
-            return True
-
-    async def active_game_round(self, session_id: str) -> dict[str, Any]:
-        async with self._lock:
-            row = self.conn.execute(
-                "SELECT * FROM game_rounds WHERE session_id=? AND phase='active'", (session_id,)
-            ).fetchone()
-            return dict(row) if row else {}
-
-    async def touch_game_round(self, session_id: str, *, hints_used: int | None = None,
-                               question_delta: int = 0, phase: str = "", now: float = 0) -> None:
-        now = float(now or time.time())
-        async with self._lock:
-            if hints_used is not None:
-                self.conn.execute(
-                    "UPDATE game_rounds SET hints_used=?,question_count=question_count+?,updated_at=? WHERE session_id=?",
-                    (int(hints_used), int(question_delta), now, session_id),
-                )
-            elif phase:
-                self.conn.execute(
-                    "UPDATE game_rounds SET phase=?,updated_at=? WHERE session_id=?",
-                    (phase, now, session_id),
-                )
-            else:
-                self.conn.execute(
-                    "UPDATE game_rounds SET question_count=question_count+?,updated_at=? WHERE session_id=?",
-                    (int(question_delta), now, session_id),
-                )
-            self.conn.commit()
-
-    async def add_game_turn(self, session_id: str, kind: str, text: str, *,
-                            user_id: str = "", verdict: str = "", now: float = 0) -> None:
-        async with self._lock:
-            self.conn.execute(
-                """INSERT INTO game_turns(session_id,user_id,kind,text,verdict,created_at)
-                VALUES(?,?,?,?,?,?)""",
-                (session_id, user_id, kind[:20], str(text)[:500], verdict[:20], float(now or time.time())),
-            )
-            self.conn.commit()
-
-    async def list_game_turns(self, session_id: str, limit: int = 30) -> list[dict[str, Any]]:
-        async with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM game_turns WHERE session_id=? ORDER BY created_at DESC LIMIT ?",
-                (session_id, max(1, min(100, int(limit)))),
-            ).fetchall()
-            return [dict(row) for row in reversed(rows)]
-
-    async def mark_puzzle_played(self, puzzle_id: str, session_id: str, now: float = 0) -> None:
-        async with self._lock:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO puzzle_played(puzzle_id,session_id,played_at) VALUES(?,?,?)",
-                (puzzle_id, session_id, float(now or time.time())),
-            )
-            self.conn.commit()
-
-    async def played_puzzle_ids(self, limit: int = 400) -> set[str]:
-        async with self._lock:
-            rows = self.conn.execute(
-                "SELECT puzzle_id FROM puzzle_played ORDER BY played_at DESC LIMIT ?",
-                (max(1, int(limit)),),
-            ).fetchall()
-            return {str(row[0]) for row in rows}
-
-    async def stale_game_rounds(self, before: float) -> list[dict[str, Any]]:
-        async with self._lock:
-            rows = self.conn.execute(
-                "SELECT * FROM game_rounds WHERE phase='active' AND updated_at<?", (float(before),)
-            ).fetchall()
-            return [dict(row) for row in rows]
 
     async def add_activity(self, item: dict[str, Any]) -> bool:
         """写入一条真实活动；同一 id 重复写入静默忽略（调用方负责生成稳定 id）。"""

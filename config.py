@@ -12,7 +12,7 @@ import re
 from maibot_sdk import Field, PluginConfigBase
 from pydantic import ValidationInfo, field_validator, model_validator
 
-PLUGIN_VERSION="1.29.0"
+PLUGIN_VERSION="1.28.0"
 CONFIG_SCHEMA_VERSION = "1.13.0"
 _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
@@ -1233,41 +1233,6 @@ class CommitmentSettings(PluginConfigBase):
                               hint_en="Pending items older than this are no longer injected."))
 
 
-class GameSettings(PluginConfigBase):
-    """海龟汤主持人：会话级单局，判定只答是/不是/无关。"""
-
-    __ui_label__: ClassVar[str] = "海龟汤"
-    __ui_order__: ClassVar[int] = 18
-
-    enabled: bool = Field(default=True, description="启用海龟汤主持人。",
-        json_schema_extra=_ui("启用海龟汤", "群里喊「来一局海龟汤」就出题，判定只回答是/不是/无关。", 0,
-                              label_en="Enable Turtle Soup",
-                              hint_en="Hosts lateral-thinking puzzles with yes/no answers."))
-    group_enabled: bool = Field(default=True, description="允许在群聊开局。",
-        json_schema_extra=_ui("群聊可开局", "关闭后只在私聊玩。", 1,
-                              label_en="Allow in Groups", hint_en="Off = private chat only."))
-    private_enabled: bool = Field(default=False, description="允许在私聊开局。",
-        json_schema_extra=_ui("私聊可开局", "私聊一轮一答，节奏慢但判定更稳。", 2,
-                              label_en="Allow in Private", hint_en="Slower but easier to control."))
-    allow_ratings: list[str] = Field(default_factory=lambda: ["light"],
-        description="允许出的题目分级：light（常规）、mid（含死亡情节）、heavy（血腥恐怖，群聊不建议）。",
-        json_schema_extra=_ui("允许的题目分级", "默认只出 light；mid/heavy 自行加，群聊里慎开。", 3,
-                              label_en="Allowed Ratings",
-                              hint_en="Default light only; add mid/heavy deliberately."))
-    difficulty: str = Field(default="", description="限定难度：easy/medium/hard，留空表示不限。",
-        json_schema_extra=_ui("难度", "留空不限；指定后优先抽该难度，抽不到自动放宽。", 4,
-                              label_en="Difficulty", hint_en="Empty = any."))
-    max_questions: int = Field(default=60, ge=5, le=300, description="一局最多允许几个问题。",
-        json_schema_extra=_ui("每局问题上限", "超过就自动揭底，防止无限拖。", 5,
-                              label_en="Max Questions", hint_en="Auto-reveal after this many."))
-    round_timeout_minutes: int = Field(default=90, ge=5, le=720, description="多久没人问自动收摊（分钟）。",
-        json_schema_extra=_ui("闲置超时（分钟）", "超时后这局作废，不再接提问。", 6,
-                              label_en="Idle Timeout", hint_en="Round expires after this idle time."))
-    library_file: str = Field(default="assets/puzzles_zh.json", description="题库文件名（插件 assets 目录内）。",
-        json_schema_extra=_ui("题库文件", "默认随插件提供的 assets/puzzles_zh.json。", 7,
-                              label_en="Library File", hint_en="Bundled JSON in assets/."))
-
-
 class MaiLifeSettings(PluginConfigBase):
     """麦生活完整配置。"""
 
@@ -1344,13 +1309,6 @@ class MaiLifeSettings(PluginConfigBase):
         json_schema_extra=_ui("兴趣知识库", "只从指定私聊学习兴趣，夜里静默联网补基本知识。", 16,
                               label_en="Interest Library",
                               hint_en="Learns interests from listed private chats and enriches them quietly at night."),
-    )
-
-    game: GameSettings = Field(
-        default_factory=GameSettings,
-        json_schema_extra=_ui("海龟汤", "会话级海龟汤主持人，判定只答是/不是/无关。", 18,
-                              label_en="Turtle Soup",
-                              hint_en="Session-scoped puzzle host with yes/no verdicts."),
     )
 
     commitment: CommitmentSettings = Field(
