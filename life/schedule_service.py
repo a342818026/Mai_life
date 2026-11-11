@@ -181,6 +181,27 @@ class ScheduleService:
             result.append({"start":start,"end":end,"kind":str(n.get("kind") or "")})
         return result
 
+    # 空话闸门：摘要只有动作大类、没有具体对象的一律视为无效内容。
+    _VAGUE_SUMMARIES=("做事","忙","处理事情","处理杂事","学习","休息","放松","自由活动",
+                      "随便逛逛","处理自己的事","日常事务","各项工作","做事为主")
+
+    @classmethod
+    def _too_vague(cls,raw:Any)->bool:
+        """节点摘要空泛比例超过 40% 视为不合格生成。
+
+        用户明确否定过「上午做事、下午闲散」这种空壳日程：既不真实也没信息量，
+        比编具体内容更差。提示词写了模型不一定听，所以结果要过闸门。
+        """
+        if not isinstance(raw,list):return True
+        total=vague=0
+        for item in raw:
+            if not isinstance(item,dict):continue
+            text=" ".join(str(item.get("summary") or "").split())
+            total+=1
+            if len(text)<=4 or any(text==word or text.startswith(word+"，") for word in cls._VAGUE_SUMMARIES):
+                vague+=1
+        return total>0 and vague/max(total,1)>0.4
+
     def _template_copycat(self,day:str,weekend:bool,raw:Any)->bool:
         """Issue #18 去重闸门：生成结果与模板/骨架的 summary 重合面 ≥50% 视为照抄（触发重试）。
 
@@ -454,7 +475,8 @@ class ScheduleService:
         if self.llm.task_available("schedule"):
             raw=await self._generate_with_retry(prompt,"你是生活日程规划器，只输出合法JSON数组。",fallback,
                 task_kind="schedule",request_type="daily_schedule",
-                check=lambda item: bool(self._validate(day,item,state)) and not self._template_copycat(day,weekend,item))
+                check=lambda item: bool(self._validate(day,item,state)) and not self._template_copycat(day,weekend,item)
+                    and not self._too_vague(item))
             if raw is None:
                 self.logger.warning("[MaiLife] 日程生成重试后仍不合格，使用兜底模板")
                 raw=fallback

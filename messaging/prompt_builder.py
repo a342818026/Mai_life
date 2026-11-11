@@ -58,29 +58,45 @@ class PromptBuilder:
         return f"{node.get('summary','')}（{node.get('location','')}）"
 
     _KIND_LABELS={"sleep":"睡觉","nap":"打盹","rest":"休息","meal":"吃饭",
-                  "work":"做事","study":"学东西","leisure":"闲散","travel":"外出"}
+                  "work":"忙正事","study":"学东西","leisure":"闲散","travel":"外出"}
+
+    # 空话判定：这些词单独成段等于没内容，日程生成时也应被拦下重试。
+    _VAGUE_WORDS=("做事","忙","处理事情","处理杂事","学习","休息","放松","自由活动",
+                  "随便逛逛","处理自己的事","日常事务","各项工作")
 
     @classmethod
     def _plan_text(cls,nodes:list[dict[str,Any]]|None)->str:
-        """当天时段的结构化摘要：只给时间 + 类型，真实的才带细节。
+        """当天安排：时间 + 具体在做什么，空泛时才退回类型词。
 
-        被问"你今天日程啥样"时，模型手里如果只有"当前是基调"，就会拿未完话题
-        （对方聊过的拳击、饺子）来填，结果把自己的话安到麦麦身上。给它这份结构，
-        它就能老老实实答"上午做事、下午闲散"，不编具体活动。
+        日程本来就是麦麦自己的虚构生活，问起来就该说得出具体事；把它降维成
+        「上午做事、下午闲散」是两头不占——既不真实也没信息量。只有节点本身写空了
+        才退回类型标签，且不得借对方聊过的事来填。
         """
-        rows=[]
+        rows=[]; vague=0
         for node in (nodes or [])[:16]:
             if not isinstance(node,dict): continue
             try:
                 start=int(node.get("start_minute") or 0); end=int(node.get("end_minute") or 0)
             except (TypeError,ValueError): continue
+            span=f"{start//60:02d}:{start%60:02d}-{end//60:02d}:{end%60:02d}"
+            summary=" ".join(str(node.get("summary") or "").split())[:60]
             label=cls._KIND_LABELS.get(str(node.get("kind") or ""),"日常")
-            if str(node.get("node_source") or "generated")=="real":
-                title=" ".join(str(node.get("summary") or "").split())[:40]
-                rows.append(f"{start//60:02d}:{start%60:02d}-{end//60:02d}:{end%60:02d} {label}（真实：{title}）")
+            if summary and not cls._is_vague(summary):
+                rows.append(f"{span} {summary}")
             else:
-                rows.append(f"{start//60:02d}:{start%60:02d}-{end//60:02d}:{end%60:02d} {label}")
-        return "；".join(rows)
+                vague+=1
+                rows.append(f"{span} {label}")
+        if not rows: return ""
+        text="；".join(rows)
+        if vague: text+=f"（其中 {vague} 段只排到类型，被追问就说没细排，别现编）"
+        return text
+
+    @classmethod
+    def _is_vague(cls,summary:str)->bool:
+        """判断一段安排是不是空话：只有动作大类、没有具体对象。"""
+        text=" ".join(str(summary or "").split())
+        if len(text)<=4: return True
+        return any(word==text or text.startswith(word+"，") for word in cls._VAGUE_WORDS)
 
     @staticmethod
     def _scene_contract(node:dict[str,Any]|None)->str:
@@ -95,9 +111,12 @@ class PromptBuilder:
         location=" ".join(str(node.get("location") or "").split())[:40]
         if str(node.get("node_source") or "generated")=="real":
             return f"已确认真实发生：{summary}（{location}）——可以自然提及这件事本身和它的细节"
-        return (f"只是时间基调（{summary}／{location}），不是已发生的事件："
-                "不得用「我正在做…」「我刚…」这类口气把它说成具体活动，"
-                "最多当作节奏、精力和情绪的底色")
+        if summary and not self._is_vague(summary):
+            return (f"你这段的安排是：{summary}（{location}）——可以自然地说自己在做这件事，"
+                    "别说成\u300c记录显示\u300d\u300c我昨天确实\u300d这种查证口气，"
+                    "也别往这里掺对方说过的事")
+        return (f"只排到类型（{summary or '未细排'}／{location}），没有具体内容："
+                "被问就说还没细排，别现编细节；最多当作节奏和精力底色")
 
     @staticmethod
     def _role_text(user:dict[str,Any])->str:
@@ -276,8 +295,9 @@ class PromptBuilder:
             f"天气 {_safe(weather.get('description','天气未知'))}；当前时段 {_safe(self._scene_contract(context.get('current')))}；"
             f"下一时段 {_safe(self._scene_contract(context.get('next')))}。\n"
             f"【今天的时段安排】{_safe(self._plan_text(context.get('nodes')))}。"
-            "这是时间结构：问起日程只能答到\u300c几点在做什么类型的事\u300d，标了\u300c真实\u300d的才可以说细节；"
-            "不得补具体活动名。\n"
+            "这是你自己这一天的安排：问起来就按上面的内容自然说自己在做什么，别只说\u300c做事\u300c忙\u300d这类空话；"
+            "内容只能从这份安排里取，标了\u300c真实\u300d的可以讲细节，标了类型的就说还没细排、别现编；"
+            "对方提过的事（运动、吃什么之类）属于对方，不得拿来当自己的经历。\n"
             "【当前消息与连续话题】\n"
             f"当前消息意图（本地初判）{_safe(current_intent or continuity.get('intent') or '未知',100)}；"
             f"未完话题 {_safe('；'.join(str(item) for item in topics) or '无',500)}；"
