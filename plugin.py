@@ -29,6 +29,7 @@ from .information.information_service import InformationService
 from .life.bedtime import BEDTIME_LOOP_SECONDS,BEDTIME_SILENCE_MINUTES,BedtimeManager
 from .life.continuity import ContinuityService
 from .life.commitment_service import CommitmentService
+from .life.game_service import GameService
 from .life.interest_service import InterestService
 from .life.life_state import LifeStateEngine
 from .life.memory_service import LUNAR_AVAILABLE,MemoryService
@@ -416,6 +417,9 @@ class MaiLifePlugin(MaiBotPlugin):
         # 被动日程：只记聊天里被派给的活（真任务/角色扮演都算），用来接话和起话题。
         self._commitment=CommitmentService(self._store,self.config,self._llm,self.ctx.logger,
                                            bot_name=self._bot_name)
+        # 海龟汤主持人：会话级单局，判定只答是/不是/无关，题库随包下发。
+        self._game=GameService(self._store,self.config,self._llm,self.ctx.logger,
+                               assets_dir=root,bot_name=self._bot_name)
         # 自主探索优先从兴趣库选题：兴趣越多、事实越少的越优先，真事才和他相关。
         self._information.set_interest_provider(self._interest.planning_topics)
         self._group_observer=GroupObserver(self._store,self.config,self._llm,self.ctx.logger)
@@ -1290,6 +1294,35 @@ class MaiLifePlugin(MaiBotPlugin):
         if not private:return await self._process_group_message(kwargs,message,uid,session,mid)
         return await self._process_private_message(kwargs,message,uid,session,mid)
 
+    async def _handle_game_message(self,kwargs:dict[str,Any],message:dict[str,Any],uid:str,
+                                  session:str,group_id:str="")->bool:
+        """海龟汤分支：开局 / 判定 / 提示 / 揭底。
+
+        返回 True 表示已经代为回复，调用方应中止主程序回复，避免一轮两次输出。
+        """
+        try:
+            text=direct_text(message).strip()
+            if not text or is_command(message):
+                return False
+            now=self._env.now()
+            scope="group" if group_id else "private"
+            reply=await self._game.try_start(session,text,scope=scope,group_id=group_id,user_id=uid,now=now)
+            if not reply:
+                reply=await self._game.handle(session,text,user_id=uid,now=now)
+            if not reply:
+                return False
+            # 群聊也要能发：走底层发送层，不用私聊专用的 _send_command（那里会拒绝群聊）。
+            stream_id=str(kwargs.get("stream_id") or session or "")
+            platform=str(kwargs.get("platform") or "qq")
+            ok=await self._require_command_replies().send_text_with_fallback(
+                str(reply),stream_id,uid,group_id,platform)
+            if not ok:
+                self.ctx.logger.warning(f"[MaiLife] 海龟汤回复发送失败 session={session}")
+            return bool(ok)
+        except Exception as exc:
+            self.ctx.logger.warning(f"[MaiLife] 海龟汤处理异常: {type(exc).__name__}: {exc}")
+            return False
+
     async def _process_group_message(self,kwargs:dict[str,Any],message:dict[str,Any],uid:str,session:str,mid:str)->dict[str,Any]:
         """群聊管线：目录登记、群轮次登记和后台公共话题观察（不注入私聊关系或生活隐私）。"""
         if session:self._group_sessions.add(session)
@@ -1303,6 +1336,10 @@ class MaiLifePlugin(MaiBotPlugin):
         group_id,group_name=group_identity(merged)
         if group_id:
             await self._store.upsert_group_directory(group_id,group_name,session,self._env.now().timestamp())
+        # 海龟汤：局中或被喊开局时，由 GameService 直接作答并吞掉本次主程序回复。
+        if self._game and self.config.game.enabled:
+            if await self._handle_game_message(kwargs, merged, uid, session, group_id):
+                return {"action":"abort"}
         # 群休息闸门（轻量版）：在群轮次登记与观察之前判定；被阻断的消息不进主程序，
         # 因此不产生 Planner/Replyer/VLM 等主程序模型请求，也不留积压与候选。
         if self._rest:
@@ -1350,6 +1387,10 @@ class MaiLifePlugin(MaiBotPlugin):
         if session:
             initial_text=direct_text(message); initial_media=media_types(message); media_hint=initial_media
         if not uid or is_command(message):return {"action":"continue"}
+        # 私聊海龟汤（默认关闭）：开启后同样走 GameService，回复由它负责。
+        if self._game and self.config.game.enabled and self.config.game.private_enabled and session:
+            if await self._handle_game_message(kwargs,message,uid,session,""):
+                return {"action":"abort"}
         user=await self._store.get_user(uid)
         if not user or not user.get("enabled"):
             # v1.24.8：未配置用户同样接受私聊休息闸门，但不写互动/积压/运行态；
