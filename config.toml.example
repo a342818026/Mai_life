@@ -267,6 +267,11 @@ retention_days = 30
 
 
 [schedule]
+# 是否生成「麦麦自己在过什么生活」的每日框架。
+# 默认关闭：日程改为被动记录（[commitment]），只记聊天里被派给的活。
+# 打开后才会按小时生成生活框架，并把它当作回复素材。
+enabled = false
+
 # 每天强制重新生成生活框架的小时，范围 0～23。
 # 插件首次启动且缺少当日日程时仍会立即生成。
 generate_hour = 3
@@ -337,3 +342,21 @@ search_include_chat_topics = false
 search_allowed_schedule_types = ["leisure", "rest"]
 search_note_retention_days = 30
 
+[commitment]
+# 被动日程：只记录私聊里「对方让我去做的事」，真任务和角色扮演任务都记。
+enabled = true
+
+# 允许记录的 QQ 号，留空表示谁都不记。只处理私聊，群聊一律不记。
+owner_qq_list = []
+
+# 每天最多调用模型抽取的次数，只有命中派活信号的消息才会抽。
+extract_daily_max = 15
+
+# 注入对话的进行中事项条数，0 表示只记录不注入。
+context_item_limit = 5
+
+# 主动搭话时可以从进行中的事项起话题，而不是汇报虚构的生活安排。
+proactive_enabled = true
+
+# 多少天内的事项仍算进行中。
+active_days = 14

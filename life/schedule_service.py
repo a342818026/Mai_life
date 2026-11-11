@@ -415,6 +415,10 @@ class ScheduleService:
     async def ensure_day(self, now: datetime, personality: str, weather_text: str, force: bool=False,
                          memory_context: dict[str,Any]|None=None,
                          environment: dict[str,Any]|None=None) -> list[dict[str, Any]]:
+        # 被动日程模式：不再生成"麦麦自己在过什么生活"。日程只由 commitments 记录，
+        # 这里保留旧数据读取能力，但不产生新框架。
+        if not bool(self.config.schedule.enabled):
+            return await self.store.get_framework(now.strftime("%Y-%m-%d"))
         day=now.strftime("%Y-%m-%d"); existing=await self.store.get_framework(day)
         if existing and not force: return existing
         # 人格串是身份的唯一来源：刷新到实例，回落模板与提示词都按它定向。
@@ -501,6 +505,7 @@ class ScheduleService:
     # 只细化临近节点，减少模型调用并保持场景与最新环境一致。
     async def expand_due(self, now: datetime, nodes: list[dict[str, Any]], state: dict[str, Any], weather_text: str) -> None:
         """细化当前与下一节点；状态增量始终由本地规则生成，模型只写叙事和机会。"""
+        if not bool(self.config.schedule.enabled): return
         minute=now.hour*60+now.minute; lead=self.config.schedule.detail_lead_minutes
         due=[n for n in nodes if n["end_minute"]>minute and n["start_minute"]<=minute+lead][:2]
         for node in due:
@@ -575,7 +580,13 @@ class ScheduleService:
         return spans
 
     async def context(self, now: datetime) -> dict[str, Any]:
-        """返回今日框架、当前/下一节点和当前节点唯一的细化场景。"""
+        """返回今日框架、当前/下一节点和当前节点唯一的细化场景。
+
+        日程关闭时连旧数据也不读：今天的框架是关闭前生成的虚构生活，
+        再注入一次就等于让模型继续把它当事实。
+        """
+        if not bool(self.config.schedule.enabled):
+            return {"nodes":[],"current":None,"next":None,"scene":{}}
         nodes=await self.store.get_framework(now.strftime("%Y-%m-%d")); minute=now.hour*60+now.minute
         current,nxt=self.current_and_next(nodes,minute); scene=await self.store.get_scene(current["id"]) if current else {}
         return {"nodes":nodes,"current":current,"next":nxt,"scene":scene}

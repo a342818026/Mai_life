@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 # 长期运行记录（互动、主动事件、契机、转述候选/事件、跳过统计）的保留天数。
 # 这些表没有过期字段驱动的外部清理，超期行必须在 cleanup_runtime_records 中删除，
 # 否则只会无限增长；pending 与在途行永远保留，避免打断正在结算的引用。
@@ -222,6 +222,18 @@ class LifeStore:
               id TEXT PRIMARY KEY, topic_id TEXT NOT NULL,
               note TEXT NOT NULL, created_at REAL NOT NULL
             );
+            -- 被动日程（v18）：不描述麦麦自己在过什么生活，只记录聊天里被派给的活。
+            -- roleplay=1 表示这活是对方让它去做的虚构任务（如"你去环游世界"），可以当话题引子。
+            CREATE TABLE IF NOT EXISTS commitments(
+              id TEXT PRIMARY KEY, user_id TEXT NOT NULL DEFAULT '',
+              scope TEXT NOT NULL DEFAULT 'private', day TEXT NOT NULL DEFAULT '',
+              content TEXT NOT NULL, roleplay INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT 'pending',
+              source_msg TEXT NOT NULL DEFAULT '',
+              created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_commitment_status ON commitments(status,created_at);
+            CREATE INDEX IF NOT EXISTS idx_commitment_content ON commitments(content);
             CREATE INDEX IF NOT EXISTS idx_framework_day ON daily_framework(day,start_minute);
             CREATE TABLE IF NOT EXISTS detailed_scenes(
               framework_id TEXT PRIMARY KEY, scene TEXT NOT NULL,
@@ -560,6 +572,8 @@ class LifeStore:
             self._migrate_to_v15()
         if version < 17:
             self._migrate_to_v17()
+        if version < 18:
+            self._migrate_to_v18()
         self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",(str(SCHEMA_VERSION),))
         now = time.time()
         self.conn.execute(
@@ -662,6 +676,14 @@ class LifeStore:
         """
         self._ensure_column("daily_framework","node_source","TEXT NOT NULL DEFAULT 'generated'")
         self._ensure_column("daily_framework","activity_id","TEXT NOT NULL DEFAULT ''")
+
+    def _migrate_to_v18(self) -> None:
+        """v18 被动日程：commitments 表由建表语句幂等创建，不做历史回填。
+
+        旧日程框架（daily_framework）不再用于叙述麦麦的生活，但保留原数据，
+        便于回退与对照；主动消息改从 commitments 取话题。
+        """
+        self._ensure_column("commitments", "roleplay", "INTEGER NOT NULL DEFAULT 0")
 
     def _migrate_to_v17(self) -> None:
         """v17 给日记加可信度标记，并把「日程整体回退」时期写成的旧日记标成 fallback。
@@ -899,6 +921,65 @@ class LifeStore:
                 conn.execute(
                     f"UPDATE daily_framework SET {', '.join(sets)} WHERE day=? AND id=?", values
                 )
+
+    # ---- 被动日程：聊天里被派给的活 ----
+    async def add_commitment(self, item: dict[str, Any]) -> str:
+        """写入一条被安排的事；内容近 7 天内重复时直接返回已有 id，不重复记。"""
+        content = " ".join(str(item.get("content") or "").split())[:200]
+        if not content:
+            return ""
+        now = float(item.get("created_at") or 0) or time.time()
+        user_id = str(item.get("user_id") or "")
+        async with self._lock:
+            dup = self.conn.execute(
+                """SELECT id FROM commitments WHERE content=? AND user_id=? AND status='pending'
+                AND created_at>? LIMIT 1""",
+                (content, user_id, now - 7 * 86400),
+            ).fetchone()
+            if dup:
+                return str(dup[0])
+            commitment_id = hashlib.sha1(
+                f"{user_id}:{content}:{now}:{os.urandom(6).hex()}".encode("utf-8", "ignore")
+            ).hexdigest()[:20]
+            self.conn.execute(
+                """INSERT OR IGNORE INTO commitments
+                (id,user_id,scope,day,content,roleplay,status,source_msg,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (commitment_id, user_id, str(item.get("scope") or "private")[:20],
+                 str(item.get("day") or "")[:10], content, 1 if item.get("roleplay") else 0,
+                 str(item.get("status") or "pending")[:20], str(item.get("source_msg") or "")[:120],
+                 now, now),
+            )
+            self.conn.commit()
+            return commitment_id
+
+    async def list_commitments(self, *, status: str = "pending", user_id: str = "",
+                               limit: int = 8) -> list[dict[str, Any]]:
+        """按状态倒序读取被安排的事；user_id 为空时返回全部。"""
+        bounded = max(1, min(50, int(limit)))
+        async with self._lock:
+            if user_id:
+                rows = self.conn.execute(
+                    "SELECT * FROM commitments WHERE status=? AND user_id=? ORDER BY created_at DESC LIMIT ?",
+                    (status, user_id, bounded),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT * FROM commitments WHERE status=? ORDER BY created_at DESC LIMIT ?",
+                    (status, bounded),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    async def update_commitment_status(self, commitment_id: str, status: str) -> bool:
+        if status not in {"pending", "doing", "done", "dropped"}:
+            return False
+        async with self._lock:
+            cursor = self.conn.execute(
+                "UPDATE commitments SET status=?,updated_at=? WHERE id=?",
+                (status, time.time(), str(commitment_id)),
+            )
+            self.conn.commit()
+            return cursor.rowcount == 1
 
     async def add_activity(self, item: dict[str, Any]) -> bool:
         """写入一条真实活动；同一 id 重复写入静默忽略（调用方负责生成稳定 id）。"""

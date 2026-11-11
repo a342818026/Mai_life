@@ -28,6 +28,7 @@ from .core.storage import LifeStore,RECORD_RETENTION_DAYS
 from .information.information_service import InformationService
 from .life.bedtime import BEDTIME_LOOP_SECONDS,BEDTIME_SILENCE_MINUTES,BedtimeManager
 from .life.continuity import ContinuityService
+from .life.commitment_service import CommitmentService
 from .life.interest_service import InterestService
 from .life.life_state import LifeStateEngine
 from .life.memory_service import LUNAR_AVAILABLE,MemoryService
@@ -412,6 +413,9 @@ class MaiLifePlugin(MaiBotPlugin):
         self._information=InformationService(self.ctx,self._store,self.config,self._llm,self.ctx.logger,bot_name=self._bot_name)
         self._interest=InterestService(self._store,self.config,self._llm,self.ctx.logger,
                                        self._information.search,bot_name=self._bot_name)
+        # 被动日程：只记聊天里被派给的活（真任务/角色扮演都算），用来接话和起话题。
+        self._commitment=CommitmentService(self._store,self.config,self._llm,self.ctx.logger,
+                                           bot_name=self._bot_name)
         # 自主探索优先从兴趣库选题：兴趣越多、事实越少的越优先，真事才和他相关。
         self._information.set_interest_provider(self._interest.planning_topics)
         self._group_observer=GroupObserver(self._store,self.config,self._llm,self.ctx.logger)
@@ -1384,6 +1388,10 @@ class MaiLifePlugin(MaiBotPlugin):
             f"mai-life-interest-{uid}",
         )
         self._spawn_transient(
+            self._commitment.observe_message(uid,text,self._env.now(),source_message_id=mid,is_private=True),
+            f"mai-life-commitment-{uid}",
+        )
+        self._spawn_transient(
             self._memory.observe_message(uid,text,self._env.now(),source_message_id=mid),
             f"mai-life-date-{uid}",
         )
@@ -1471,6 +1479,7 @@ class MaiLifePlugin(MaiBotPlugin):
                                                      self._bookshelf.context_for_user,user),
                 "dream":await self._cached_block("dream","",now,self._store.latest_dream),
                 "interest":await self._interest.context_for(str(runtime.get("text") or ""),now),
+                "commitments":await self._commitment.text_for_prompt(now),
                 "bedtime":bedtime}
 
     @staticmethod
@@ -1571,7 +1580,8 @@ class MaiLifePlugin(MaiBotPlugin):
                                                             payload["backlogs"],payload["environment"],payload["continuity"],payload["intent"],
                                                             int(self.config.context.prompt_max_chars),memory=payload["memory"],information=payload["information"],
                                                             bookshelf=payload["bookshelf"],interest=payload.get("interest"),
-                                                            bot_name=self._bot_name,bedtime=payload["bedtime"])
+                                                            bot_name=self._bot_name,bedtime=payload["bedtime"],
+                                                            commitments=payload.get("commitments",""))
         if active:
             # reply 的 msg_id 必须引用会话最近一条真实用户消息：proactive:xxx 任务编号宿主 reply 工具
             # 查不到（find_source_message_by_id 不认），报错还会被 to_display_message_id 哈希成乱码。
@@ -1619,7 +1629,8 @@ class MaiLifePlugin(MaiBotPlugin):
                                              min(2400,int(self.config.context.prompt_max_chars)),memory=payload["memory"],information=payload["information"],
                                              bookshelf=payload["bookshelf"],interest=payload.get("interest"),
                                              bot_name=self._bot_name,bedtime=payload["bedtime"],
-                                             detail=str(self.config.context.replyer_detail))
+                                             detail=str(self.config.context.replyer_detail),
+                                             commitments=payload.get("commitments",""))
         if active and active.kind=="relay" and self._relay and self.config.group.relay_enabled:
             suffix+=await self._relay.prompt_context(session,active.task_id)
         if not suffix:return {"action":"continue"}

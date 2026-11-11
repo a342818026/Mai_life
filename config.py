@@ -12,7 +12,7 @@ import re
 from maibot_sdk import Field, PluginConfigBase
 from pydantic import ValidationInfo, field_validator, model_validator
 
-PLUGIN_VERSION="1.27.3"
+PLUGIN_VERSION="1.28.0"
 CONFIG_SCHEMA_VERSION = "1.13.0"
 _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
@@ -977,6 +977,16 @@ class ScheduleSettings(PluginConfigBase):
         "en_US": {"title": "Schedule and Scenes", "description": "Daily framework generation and near-term scene expansion."}
     }
 
+    enabled: bool = Field(
+        default=False,
+        description="是否生成每日生活框架（麦麦自己在过什么生活）。默认关闭：日程改为「被动记录」，只记聊天里被派给的活。",
+        json_schema_extra=_ui(
+            "生成每日日程", "默认关闭。关闭后不再编造麦麦自己的生活安排，只在被指派时记录承诺任务；"
+            "开启才会按小时生成生活框架。", -1,
+            label_en="Generate Daily Schedule",
+            hint_en="Off by default: no invented personal schedule. Commitments are still recorded.",
+        ),
+    )
     generate_hour: int = Field(
         default=3, ge=0, le=23,
         description="每天强制重新生成生活框架的小时。",
@@ -1191,6 +1201,38 @@ class InterestSettings(PluginConfigBase):
                               hint_en="One note per topic per day."))
 
 
+class CommitmentSettings(PluginConfigBase):
+    """被动日程：只记录聊天里被派给的活，不再描述麦麦自己在过什么生活。"""
+
+    __ui_label__: ClassVar[str] = "被动日程"
+    __ui_order__: ClassVar[int] = 17
+
+    enabled: bool = Field(default=True, description="启用被动日程记录。",
+        json_schema_extra=_ui("启用被动日程", "从私聊里抽取「对方让我去做的事」，真任务和角色扮演任务都记。", 0,
+                              label_en="Enable Commitments",
+                              hint_en="Extract tasks assigned by the owner, real or roleplay."))
+    owner_qq_list: list[str] = Field(default_factory=list, description="允许记录承诺的 QQ 号（只记这些人的私聊）。",
+        json_schema_extra=_ui("记录对象 QQ 号", "留空表示不记录任何人的指派；群聊一律不记。", 1,
+                              label_en="Owner QQ List",
+                              hint_en="Only these QQ numbers, private chat only."))
+    extract_daily_max: int = Field(default=15, ge=0, le=100, description="每天最多调用模型抽取的次数。",
+        json_schema_extra=_ui("每日抽取上限", "只有命中派活信号的消息才会抽取。", 2,
+                              label_en="Daily Extraction Limit",
+                              hint_en="Only messages with assignment signals are extracted."))
+    context_item_limit: int = Field(default=5, ge=0, le=10, description="注入对话的进行中事项条数。",
+        json_schema_extra=_ui("注入条数", "0 表示只记录不注入。", 3,
+                              label_en="Injected Items",
+                              hint_en="0 means record only."))
+    proactive_enabled: bool = Field(default=True, description="主动搭话时可以从进行中的事项起话题。",
+        json_schema_extra=_ui("主动搭话用这些事项", "把「你让我做的事」当作起话题的由头，而不是汇报虚构生活。", 4,
+                              label_en="Use for Proactive Topics",
+                              hint_en="Use commitments as conversation openers instead of invented daily life."))
+    active_days: int = Field(default=14, ge=1, le=120, description="多少天内的事项仍算进行中。",
+        json_schema_extra=_ui("有效期（天）", "超过天数的 pending 事项不再注入，也不再用作话题。", 5,
+                              label_en="Active Days",
+                              hint_en="Pending items older than this are no longer injected."))
+
+
 class MaiLifeSettings(PluginConfigBase):
     """麦生活完整配置。"""
 
@@ -1267,6 +1309,13 @@ class MaiLifeSettings(PluginConfigBase):
         json_schema_extra=_ui("兴趣知识库", "只从指定私聊学习兴趣，夜里静默联网补基本知识。", 16,
                               label_en="Interest Library",
                               hint_en="Learns interests from listed private chats and enriches them quietly at night."),
+    )
+
+    commitment: CommitmentSettings = Field(
+        default_factory=CommitmentSettings,
+        json_schema_extra=_ui("被动日程", "只记录聊天里被派给的活，不再编造麦麦自己的生活安排。", 17,
+                              label_en="Commitments",
+                              hint_en="Records tasks assigned in chat instead of inventing a daily life."),
     )
 
     @model_validator(mode="before")

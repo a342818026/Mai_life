@@ -85,12 +85,15 @@ class LLMService:
             "reading_annotation": models.reading_annotation_task or models.creative_task,
             # 兴趣抽取/补知识是结构化短任务，走快模型即可；未配置时也回落到快模型。
             "interest": models.fast_task,
+            # 被动日程抽取同理：短结构化任务。
+            "commitment": models.fast_task,
         }
         return str(routes.get(kind) or models.reasoning_task or "planner").strip()
 
     def _active_task_kinds(self) -> set[str]:
         """只检查当前启用功能会实际调用的任务，fallback 不因此阻止插件启动。"""
-        kinds={"schedule","scene_detail"}
+        # 日程功能默认关闭（被动日程模式），关闭时不该把这两个任务拖进健康检查。
+        kinds={"schedule","scene_detail"} if self.config.schedule.enabled else set()
         if self.config.context.enabled and self.config.context.continuity_enabled:kinds.add("continuity")
         if self.config.rest_gate.enabled and self.config.rest_gate.mode=="llm":kinds.add("rest_wakeup")
         if self.config.memory.enabled:
@@ -111,6 +114,9 @@ class LLMService:
         interest=getattr(self.config,"interest",None)
         if interest is not None and interest.enabled and interest.owner_qq_list:
             kinds.add("interest")
+        commitment=getattr(self.config,"commitment",None)
+        if commitment is not None and commitment.enabled and commitment.owner_qq_list:
+            kinds.add("commitment")
         return kinds
 
     async def refresh_health(self) -> set[str]:
